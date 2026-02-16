@@ -1,14 +1,43 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+mod commands;
+mod config;
+mod db;
+mod llm;
+mod profile;
+
+use commands::AppState;
+use std::sync::Mutex;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .plugin(tauri_plugin_shell::init())
+        .setup(|app| {
+            let app_data_dir = app.path().app_data_dir().expect("Failed to get app data dir");
+            std::fs::create_dir_all(&app_data_dir).expect("Failed to create app data dir");
+
+            let db_path = app_data_dir.join("database.sqlite");
+            let database = db::Database::new(db_path.to_str().unwrap())
+                .expect("Failed to initialize database");
+
+            app.manage(Mutex::new(AppState {
+                db: database,
+                app_data_dir,
+            }));
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::send_message,
+            commands::get_conversations,
+            commands::get_messages,
+            commands::get_settings,
+            commands::save_settings,
+            commands::get_profile_files,
+            commands::open_profile_folder,
+            commands::delete_conversation,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

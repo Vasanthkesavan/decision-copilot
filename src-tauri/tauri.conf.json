@@ -12,9 +12,9 @@
   "app": {
     "windows": [
       {
-        "title": "decision-copilot",
-        "width": 800,
-        "height": 600
+        "title": "Decision Copilot",
+        "width": 1100,
+        "height": 750
       }
     ],
     "security": {
