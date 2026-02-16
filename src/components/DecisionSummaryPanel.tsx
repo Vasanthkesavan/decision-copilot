@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import CommitteeVoteTally from "./CommitteeVoteTally";
+import type { AgentMeta } from "@/lib/agentColors";
 
 interface Option {
   label: string;
@@ -55,6 +56,7 @@ interface DecisionSummaryPanelProps {
   userChoiceReasoning?: string | null;
   outcome?: string | null;
   outcomeDate?: string | null;
+  registry?: AgentMeta[];
   onAcceptRecommendation?: () => void;
   onChoseDifferently?: () => void;
   onNeedMoreTime?: () => void;
@@ -112,6 +114,7 @@ export default function DecisionSummaryPanel({
   userChoiceReasoning,
   outcome,
   outcomeDate,
+  registry = [],
   onAcceptRecommendation,
   onChoseDifferently,
   onNeedMoreTime,
@@ -335,7 +338,7 @@ export default function DecisionSummaryPanel({
           <>
             {summary.debate_summary.final_votes &&
               Object.keys(summary.debate_summary.final_votes).length > 0 && (
-                <CommitteeVoteTally votes={summary.debate_summary.final_votes} />
+                <CommitteeVoteTally votes={summary.debate_summary.final_votes} registry={registry} />
               )}
 
             {summary.debate_summary.consensus_points &&

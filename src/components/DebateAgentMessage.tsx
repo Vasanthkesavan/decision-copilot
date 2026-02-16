@@ -2,71 +2,28 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import { cn } from "@/lib/utils";
-
-const AGENT_CONFIG: Record<
-  string,
-  { emoji: string; label: string; color: string; bgColor: string }
-> = {
-  rationalist: {
-    emoji: "\u{1f9ee}",
-    label: "Rationalist",
-    color: "text-blue-400",
-    bgColor: "border-blue-500/30",
-  },
-  advocate: {
-    emoji: "\u{1f49c}",
-    label: "Advocate",
-    color: "text-purple-400",
-    bgColor: "border-purple-500/30",
-  },
-  contrarian: {
-    emoji: "\u{1f534}",
-    label: "Contrarian",
-    color: "text-red-400",
-    bgColor: "border-red-500/30",
-  },
-  visionary: {
-    emoji: "\u{1f52d}",
-    label: "Visionary",
-    color: "text-teal-400",
-    bgColor: "border-teal-500/30",
-  },
-  pragmatist: {
-    emoji: "\u{1f527}",
-    label: "Pragmatist",
-    color: "text-orange-400",
-    bgColor: "border-orange-500/30",
-  },
-  moderator: {
-    emoji: "\u{1f3af}",
-    label: "Moderator",
-    color: "text-amber-400",
-    bgColor: "border-amber-500/40",
-  },
-};
+import { resolveAgentConfig } from "@/lib/agentColors";
+import type { AgentMeta } from "@/lib/agentColors";
 
 interface DebateAgentMessageProps {
   agent: string;
   content: string;
   isStreaming?: boolean;
+  registry?: AgentMeta[];
 }
 
 export default function DebateAgentMessage({
   agent,
   content,
   isStreaming,
+  registry,
 }: DebateAgentMessageProps) {
   const normalizedContent =
     !content.includes("\n") && content.includes("\\n")
       ? content.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n")
       : content;
 
-  const config = AGENT_CONFIG[agent] || {
-    emoji: "?",
-    label: agent,
-    color: "text-muted-foreground",
-    bgColor: "border-border",
-  };
+  const config = resolveAgentConfig(agent, registry || []);
 
   return (
     <div className={cn("pl-3 border-l-2 mb-3", config.bgColor)}>
@@ -87,5 +44,3 @@ export default function DebateAgentMessage({
     </div>
   );
 }
-
-export { AGENT_CONFIG };

@@ -1,8 +1,22 @@
 /// Committee debate agent definitions — personas, system prompts, and round templates.
+/// Agents are stored as a registry (registry.json) + individual prompt files (.md).
 
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+
+// ── Data types ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub key: String,
+    pub label: String,
+    pub emoji: String,
+    pub color: String,      // Tailwind color name: "blue", "red", "teal", etc.
+    pub role: String,        // "debater" or "moderator"
+    pub builtin: bool,
+    pub sort_order: u32,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentFileInfo {
@@ -12,16 +26,84 @@ pub struct AgentFileInfo {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentRegistry {
+    version: u32,
+    agents: Vec<AgentInfo>,
+}
+
+// ── Built-in agent definitions ──
+
+pub fn builtin_agents() -> Vec<AgentInfo> {
+    vec![
+        AgentInfo { key: "rationalist".into(), label: "Rationalist".into(), emoji: "\u{1f9ee}".into(), color: "blue".into(), role: "debater".into(), builtin: true, sort_order: 0 },
+        AgentInfo { key: "advocate".into(), label: "Advocate".into(), emoji: "\u{1f49c}".into(), color: "purple".into(), role: "debater".into(), builtin: true, sort_order: 1 },
+        AgentInfo { key: "contrarian".into(), label: "Contrarian".into(), emoji: "\u{1f534}".into(), color: "red".into(), role: "debater".into(), builtin: true, sort_order: 2 },
+        AgentInfo { key: "visionary".into(), label: "Visionary".into(), emoji: "\u{1f52d}".into(), color: "teal".into(), role: "debater".into(), builtin: true, sort_order: 3 },
+        AgentInfo { key: "pragmatist".into(), label: "Pragmatist".into(), emoji: "\u{1f527}".into(), color: "orange".into(), role: "debater".into(), builtin: true, sort_order: 4 },
+        AgentInfo { key: "moderator".into(), label: "Moderator".into(), emoji: "\u{1f3af}".into(), color: "amber".into(), role: "moderator".into(), builtin: true, sort_order: 100 },
+    ]
+}
+
+/// Return the hardcoded default prompt for a built-in agent key.
+pub fn default_prompt_for_key(key: &str) -> Option<&'static str> {
+    match key {
+        "rationalist" => Some(RATIONALIST_PROMPT),
+        "advocate" => Some(ADVOCATE_PROMPT),
+        "contrarian" => Some(CONTRARIAN_PROMPT),
+        "visionary" => Some(VISIONARY_PROMPT),
+        "pragmatist" => Some(PRAGMATIST_PROMPT),
+        "moderator" => Some(MODERATOR_PROMPT),
+        _ => None,
+    }
+}
+
+// ── Registry I/O ──
+
 pub fn get_agents_dir(app_data_dir: &PathBuf) -> PathBuf {
     app_data_dir.join("agents")
 }
 
-/// Ensure all agent prompt files exist on disk, writing defaults for any missing ones.
+fn registry_path(app_data_dir: &PathBuf) -> PathBuf {
+    get_agents_dir(app_data_dir).join("registry.json")
+}
+
+/// Load the agent registry from disk, creating it with built-in defaults if missing.
+pub fn load_registry(app_data_dir: &PathBuf) -> Vec<AgentInfo> {
+    let path = registry_path(app_data_dir);
+    if let Ok(content) = fs::read_to_string(&path) {
+        if let Ok(registry) = serde_json::from_str::<AgentRegistry>(&content) {
+            return registry.agents;
+        }
+    }
+    // Registry missing or corrupt — seed with built-ins and save
+    let agents = builtin_agents();
+    let _ = save_registry(app_data_dir, &agents);
+    agents
+}
+
+/// Save the agent registry to disk.
+pub fn save_registry(app_data_dir: &PathBuf, agents: &[AgentInfo]) -> Result<(), String> {
+    let dir = get_agents_dir(app_data_dir);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let registry = AgentRegistry { version: 1, agents: agents.to_vec() };
+    let content = serde_json::to_string_pretty(&registry).map_err(|e| e.to_string())?;
+    fs::write(registry_path(app_data_dir), content).map_err(|e| e.to_string())
+}
+
+// ── Agent prompt file I/O ──
+
+/// Ensure all built-in agent prompt files exist on disk, writing defaults for any missing ones.
+/// Also ensures the registry.json exists.
 pub fn init_agent_files(app_data_dir: &PathBuf) -> Result<(), String> {
     let dir = get_agents_dir(app_data_dir);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let agents = [
+    // Ensure registry exists (creates from builtins if missing)
+    let _agents = load_registry(app_data_dir);
+
+    // Ensure built-in prompt files exist
+    let builtins = [
         ("rationalist.md", RATIONALIST_PROMPT),
         ("advocate.md", ADVOCATE_PROMPT),
         ("contrarian.md", CONTRARIAN_PROMPT),
@@ -30,7 +112,7 @@ pub fn init_agent_files(app_data_dir: &PathBuf) -> Result<(), String> {
         ("moderator.md", MODERATOR_PROMPT),
     ];
 
-    for (filename, default_content) in &agents {
+    for (filename, default_content) in &builtins {
         let path = dir.join(filename);
         if !path.exists() {
             fs::write(&path, default_content).map_err(|e| e.to_string())?;
@@ -40,18 +122,24 @@ pub fn init_agent_files(app_data_dir: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-/// Read a single agent's prompt from file, falling back to the hardcoded default.
-pub fn read_agent_prompt(app_data_dir: &PathBuf, agent: &Agent) -> String {
+/// Read a single agent's prompt from file, falling back to the hardcoded default (for builtins).
+pub fn read_agent_prompt(app_data_dir: &PathBuf, agent_key: &str) -> String {
     let dir = get_agents_dir(app_data_dir);
-    let filename = format!("{}.md", agent.key());
+    let filename = format!("{}.md", agent_key);
     let path = dir.join(&filename);
-    fs::read_to_string(&path).unwrap_or_else(|_| agent.default_prompt().to_string())
+    fs::read_to_string(&path).unwrap_or_else(|_| {
+        default_prompt_for_key(agent_key)
+            .unwrap_or("You are a committee member. Analyze the decision from your unique perspective.")
+            .to_string()
+    })
 }
 
-/// Read all agent prompt files with metadata.
+/// Read all agent prompt files with metadata, ordered by registry sort_order.
 pub fn read_all_agent_files(app_data_dir: &PathBuf) -> Result<Vec<AgentFileInfo>, String> {
     let dir = get_agents_dir(app_data_dir);
     init_agent_files(app_data_dir)?;
+
+    let registry = load_registry(app_data_dir);
 
     let mut files = Vec::new();
     let entries = fs::read_dir(&dir).map_err(|e| e.to_string())?;
@@ -74,13 +162,14 @@ pub fn read_all_agent_files(app_data_dir: &PathBuf) -> Result<Vec<AgentFileInfo>
             });
         }
     }
-    // Sort in a fixed order matching the agent list
-    let order = ["rationalist", "advocate", "contrarian", "visionary", "pragmatist", "moderator"];
+
+    // Sort by registry sort_order
+    let order: Vec<String> = registry.iter().map(|a| a.key.clone()).collect();
     files.sort_by(|a, b| {
         let a_key = a.filename.trim_end_matches(".md");
         let b_key = b.filename.trim_end_matches(".md");
-        let a_idx = order.iter().position(|&x| x == a_key).unwrap_or(99);
-        let b_idx = order.iter().position(|&x| x == b_key).unwrap_or(99);
+        let a_idx = order.iter().position(|x| x == a_key).unwrap_or(99);
+        let b_idx = order.iter().position(|x| x == b_key).unwrap_or(99);
         a_idx.cmp(&b_idx)
     });
     Ok(files)
@@ -95,78 +184,97 @@ pub fn write_agent_file(app_data_dir: &PathBuf, filename: &str, content: &str) -
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Agent {
-    Rationalist,
-    Advocate,
-    Contrarian,
-    Visionary,
-    Pragmatist,
-    Moderator,
+/// Add a custom agent to the registry and write its prompt file.
+pub fn create_custom_agent(
+    app_data_dir: &PathBuf,
+    label: &str,
+    emoji: &str,
+    prompt: &str,
+) -> Result<AgentInfo, String> {
+    let mut registry = load_registry(app_data_dir);
+
+    // Generate key from label
+    let key = label
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+
+    if key.is_empty() {
+        return Err("Agent name must contain at least one alphanumeric character".to_string());
+    }
+
+    // Check uniqueness
+    if registry.iter().any(|a| a.key == key) {
+        return Err(format!("An agent with key '{}' already exists", key));
+    }
+
+    // Pick a color that's not heavily used
+    let used_colors: Vec<&str> = registry.iter().map(|a| a.color.as_str()).collect();
+    let available_colors = ["green", "pink", "cyan", "indigo", "blue", "purple", "red", "teal", "orange"];
+    let color = available_colors
+        .iter()
+        .find(|c| !used_colors.contains(c))
+        .unwrap_or(&"blue")
+        .to_string();
+
+    // Determine sort order (before moderator, after last debater)
+    let max_debater_order = registry.iter()
+        .filter(|a| a.role == "debater")
+        .map(|a| a.sort_order)
+        .max()
+        .unwrap_or(4);
+
+    let agent = AgentInfo {
+        key: key.clone(),
+        label: label.to_string(),
+        emoji: emoji.to_string(),
+        color,
+        role: "debater".to_string(),
+        builtin: false,
+        sort_order: max_debater_order + 1,
+    };
+
+    // Write prompt file
+    write_agent_file(app_data_dir, &format!("{}.md", key), prompt)?;
+
+    // Add to registry
+    registry.push(agent.clone());
+    save_registry(app_data_dir, &registry)?;
+
+    Ok(agent)
 }
 
-impl Agent {
-    pub fn all_debaters() -> Vec<Agent> {
-        vec![
-            Agent::Rationalist,
-            Agent::Advocate,
-            Agent::Contrarian,
-            Agent::Visionary,
-            Agent::Pragmatist,
-        ]
+/// Delete a custom (non-builtin) agent.
+pub fn delete_custom_agent(app_data_dir: &PathBuf, agent_key: &str) -> Result<(), String> {
+    let mut registry = load_registry(app_data_dir);
+
+    let agent = registry.iter()
+        .find(|a| a.key == agent_key)
+        .ok_or_else(|| format!("Agent '{}' not found", agent_key))?;
+
+    if agent.builtin {
+        return Err("Cannot delete built-in agents".to_string());
     }
 
-    pub fn key(&self) -> &'static str {
-        match self {
-            Agent::Rationalist => "rationalist",
-            Agent::Advocate => "advocate",
-            Agent::Contrarian => "contrarian",
-            Agent::Visionary => "visionary",
-            Agent::Pragmatist => "pragmatist",
-            Agent::Moderator => "moderator",
-        }
+    registry.retain(|a| a.key != agent_key);
+    save_registry(app_data_dir, &registry)?;
+
+    // Delete prompt file
+    let dir = get_agents_dir(app_data_dir);
+    let path = dir.join(format!("{}.md", agent_key));
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
 
-    pub fn label(&self) -> &'static str {
-        match self {
-            Agent::Rationalist => "Rationalist",
-            Agent::Advocate => "Advocate",
-            Agent::Contrarian => "Contrarian",
-            Agent::Visionary => "Visionary",
-            Agent::Pragmatist => "Pragmatist",
-            Agent::Moderator => "Moderator",
-        }
-    }
-
-    pub fn emoji(&self) -> &'static str {
-        match self {
-            Agent::Rationalist => "\u{1f9ee}",  // 🧮
-            Agent::Advocate => "\u{1f49c}",      // 💜
-            Agent::Contrarian => "\u{1f534}",    // 🔴
-            Agent::Visionary => "\u{1f52d}",     // 🔭
-            Agent::Pragmatist => "\u{1f527}",    // 🔧
-            Agent::Moderator => "\u{1f3af}",     // 🎯
-        }
-    }
-
-    pub fn default_prompt(&self) -> &'static str {
-        match self {
-            Agent::Rationalist => RATIONALIST_PROMPT,
-            Agent::Advocate => ADVOCATE_PROMPT,
-            Agent::Contrarian => CONTRARIAN_PROMPT,
-            Agent::Visionary => VISIONARY_PROMPT,
-            Agent::Pragmatist => PRAGMATIST_PROMPT,
-            Agent::Moderator => MODERATOR_PROMPT,
-        }
-    }
-
-    /// Load prompt from file, falling back to default.
-    pub fn load_prompt(&self, app_data_dir: &PathBuf) -> String {
-        read_agent_prompt(app_data_dir, self)
-    }
+    Ok(())
 }
 
-const RATIONALIST_PROMPT: &str = r#"You are The Rationalist on a decision-making committee. You analyze decisions through pure logic, expected value calculations, and probabilistic thinking. You strip away emotion and look at what the numbers say.
+// ── Prompt constants ──
+
+pub const RATIONALIST_PROMPT: &str = r#"You are The Rationalist on a decision-making committee. You analyze decisions through pure logic, expected value calculations, and probabilistic thinking. You strip away emotion and look at what the numbers say.
 
 Your approach:
 - Quantify everything possible (money, time, probability of outcomes)
@@ -185,7 +293,7 @@ IMPORTANT — Debate style rules:
 - No filler phrases, no restating the question, no unnecessary preamble
 - Get to your point FAST. This is a debate, not an essay."#;
 
-const ADVOCATE_PROMPT: &str = r#"You are The Advocate on a decision-making committee. You focus on the human element — emotional wellbeing, relationships, personal fulfillment, and alignment with deeply held values. You ensure the committee doesn't optimize for metrics while ignoring what actually makes this person's life meaningful.
+pub const ADVOCATE_PROMPT: &str = r#"You are The Advocate on a decision-making committee. You focus on the human element — emotional wellbeing, relationships, personal fulfillment, and alignment with deeply held values. You ensure the committee doesn't optimize for metrics while ignoring what actually makes this person's life meaningful.
 
 Your approach:
 - Center the person's emotional state and wellbeing
@@ -204,7 +312,7 @@ IMPORTANT — Debate style rules:
 - No filler phrases, no restating the question, no unnecessary preamble
 - Get to your point FAST. This is a debate, not an essay."#;
 
-const CONTRARIAN_PROMPT: &str = r#"You are The Contrarian on a decision-making committee. Your job is to challenge the emerging consensus, surface hidden risks, question assumptions, and ensure the committee isn't falling into groupthink. Whatever direction the group is leaning, you pressure-test it.
+pub const CONTRARIAN_PROMPT: &str = r#"You are The Contrarian on a decision-making committee. Your job is to challenge the emerging consensus, surface hidden risks, question assumptions, and ensure the committee isn't falling into groupthink. Whatever direction the group is leaning, you pressure-test it.
 
 Your approach:
 - Identify the assumption everyone is making and question it
@@ -223,7 +331,7 @@ IMPORTANT — Debate style rules:
 - No filler phrases, no restating the question, no unnecessary preamble
 - Get to your point FAST. This is a debate, not an essay."#;
 
-const VISIONARY_PROMPT: &str = r#"You are The Visionary on a decision-making committee. You think in timelines of 5-10 years. While others debate the immediate tradeoffs, you focus on where each path leads — what doors open, what doors close, and what kind of life each option builds toward over time.
+pub const VISIONARY_PROMPT: &str = r#"You are The Visionary on a decision-making committee. You think in timelines of 5-10 years. While others debate the immediate tradeoffs, you focus on where each path leads — what doors open, what doors close, and what kind of life each option builds toward over time.
 
 Your approach:
 - Project each option forward 1, 3, 5, and 10 years
@@ -242,7 +350,7 @@ IMPORTANT — Debate style rules:
 - No filler phrases, no restating the question, no unnecessary preamble
 - Get to your point FAST. This is a debate, not an essay."#;
 
-const PRAGMATIST_PROMPT: &str = r#"You are The Pragmatist on a decision-making committee. You focus on what's actually executable given real-world constraints. While others debate what's optimal in theory, you ground the conversation in what this specific person can actually do, given their time, energy, resources, and situation.
+pub const PRAGMATIST_PROMPT: &str = r#"You are The Pragmatist on a decision-making committee. You focus on what's actually executable given real-world constraints. While others debate what's optimal in theory, you ground the conversation in what this specific person can actually do, given their time, energy, resources, and situation.
 
 Your approach:
 - Reality-check every recommendation against the person's actual constraints
@@ -261,12 +369,12 @@ IMPORTANT — Debate style rules:
 - No filler phrases, no restating the question, no unnecessary preamble
 - Get to your point FAST. This is a debate, not an essay."#;
 
-const MODERATOR_PROMPT: &str = r#"You are The Moderator of a decision-making committee. You have just observed a debate between five committee members — The Rationalist, The Advocate, The Contrarian, The Visionary, and The Pragmatist — about a personal decision.
+pub const MODERATOR_PROMPT: &str = r#"You are The Moderator of a decision-making committee. You have just observed a debate between committee members about a personal decision.
 
 Your job is to synthesize the debate into a clear, actionable recommendation. You are not a neutral summarizer — you must commit to a recommendation.
 
 Your synthesis must:
-1. Identify where the committee agreed (high-signal — if all five perspectives converge, it's likely right)
+1. Identify where the committee agreed (high-signal — if all perspectives converge, it's likely right)
 2. Identify the key disagreements and who had the stronger argument in each case
 3. Note which cognitive biases or blind spots were surfaced
 4. Weigh the arguments according to the person's actual values and priorities from their profile
@@ -345,9 +453,11 @@ STRICT LIMIT: Under 80 words. No hedging."#
     )
 }
 
-pub fn moderator_prompt(brief: &str, transcript: &str) -> String {
+pub fn moderator_prompt(brief: &str, transcript: &str, participants: &str) -> String {
     format!(
         r#"{brief}
+
+The following committee members participated in this debate: {participants}
 
 Here is the full committee debate:
 
@@ -377,35 +487,162 @@ Synthesize this debate into a clear recommendation. Structure your response as:
     )
 }
 
+/// Build a human-readable participant description like "The Rationalist, The Advocate, and The Pragmatist"
+pub fn format_participant_names(debaters: &[AgentInfo]) -> String {
+    let names: Vec<String> = debaters.iter().map(|a| format!("The {}", a.label)).collect();
+    match names.len() {
+        0 => "no debaters".to_string(),
+        1 => names[0].clone(),
+        2 => format!("{} and {}", names[0], names[1]),
+        _ => {
+            let (last, rest) = names.split_last().unwrap();
+            format!("{}, and {}", rest.join(", "), last)
+        }
+    }
+}
+
+/// Template for generating a custom agent's system prompt via LLM.
+pub fn agent_generation_prompt(label: &str, description: &str) -> (String, String) {
+    let system = r#"You are helping create a committee member persona for a decision-making app called Open Council. The app has a committee of AI agents that debate personal decisions from different perspectives.
+
+Each committee member has a system prompt that defines their persona, approach, and debate style. Generate a system prompt for a new committee member.
+
+The prompt should follow this exact structure:
+1. Opening line: "You are The [Name] on a decision-making committee." followed by a 1-2 sentence description of their perspective
+2. "Your approach:" section with exactly 5 bullet points
+3. "Your tone:" section with 2-3 sentences and example phrases
+4. The debate style rules block (include this EXACTLY as shown below)
+
+IMPORTANT — Debate style rules:
+- Write in SHORT, punchy paragraphs (2-3 sentences max per point)
+- Use bullet points for lists — no long flowing prose
+- When responding to others, quote them briefly then give your counter
+- Be direct and opinionated, not diplomatic or verbose
+- No filler phrases, no restating the question, no unnecessary preamble
+- Get to your point FAST. This is a debate, not an essay.
+
+Return ONLY the system prompt text. No commentary, no markdown code fences."#;
+
+    let user = format!(
+        r#"Create a committee member system prompt for:
+
+Name: {}
+Role description: {}
+
+Here is an example of an existing committee member prompt for reference:
+
+---
+{}
+---
+
+Now generate the new member's prompt following the same structure."#,
+        label, description, RATIONALIST_PROMPT
+    );
+
+    (system.to_string(), user)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
     #[test]
-    fn unit_agent_registry_has_expected_keys_and_labels() {
-        let debaters = Agent::all_debaters();
+    fn unit_builtin_agents_has_expected_keys_and_labels() {
+        let agents = builtin_agents();
+        assert_eq!(agents.len(), 6);
+        assert_eq!(agents[0].key, "rationalist");
+        assert_eq!(agents[0].label, "Rationalist");
+        assert_eq!(agents[5].key, "moderator");
+        assert_eq!(agents[5].label, "Moderator");
+
+        let debaters: Vec<&AgentInfo> = agents.iter().filter(|a| a.role == "debater").collect();
         assert_eq!(debaters.len(), 5);
-        assert_eq!(debaters[0].key(), "rationalist");
-        assert_eq!(debaters[0].label(), "Rationalist");
-        assert_eq!(Agent::Moderator.key(), "moderator");
-        assert_eq!(Agent::Moderator.label(), "Moderator");
     }
 
     #[test]
-    fn integration_init_agent_files_creates_defaults_and_respects_overrides() {
+    fn unit_default_prompt_for_key_returns_prompts_for_builtins() {
+        assert!(default_prompt_for_key("rationalist").is_some());
+        assert!(default_prompt_for_key("moderator").is_some());
+        assert!(default_prompt_for_key("unknown").is_none());
+    }
+
+    #[test]
+    fn unit_format_participant_names_handles_various_counts() {
+        let agents = builtin_agents();
+        let debaters: Vec<AgentInfo> = agents.into_iter().filter(|a| a.role == "debater").collect();
+
+        let result = format_participant_names(&debaters);
+        assert!(result.contains("The Rationalist"));
+        assert!(result.contains("and The Pragmatist"));
+
+        let one = vec![debaters[0].clone()];
+        assert_eq!(format_participant_names(&one), "The Rationalist");
+
+        let two = vec![debaters[0].clone(), debaters[1].clone()];
+        assert_eq!(format_participant_names(&two), "The Rationalist and The Advocate");
+    }
+
+    #[test]
+    fn integration_init_agent_files_creates_defaults_and_registry() {
         let dir = tempdir().expect("temp directory should exist");
         let app_data_dir = dir.path().to_path_buf();
 
         init_agent_files(&app_data_dir).expect("agent files should initialize");
+
+        // Registry should exist
+        let registry = load_registry(&app_data_dir);
+        assert_eq!(registry.len(), 6);
+
+        // Prompt files should exist
         let files = read_all_agent_files(&app_data_dir).expect("agent files should load");
         assert_eq!(files.len(), 6);
         assert_eq!(files[0].filename, "rationalist.md");
         assert_eq!(files[5].filename, "moderator.md");
+    }
+
+    #[test]
+    fn integration_custom_agent_lifecycle() {
+        let dir = tempdir().expect("temp directory should exist");
+        let app_data_dir = dir.path().to_path_buf();
+
+        init_agent_files(&app_data_dir).expect("agent files should initialize");
+
+        // Create custom agent
+        let agent = create_custom_agent(&app_data_dir, "Economist", "\u{1f4b0}", "Custom prompt")
+            .expect("should create agent");
+        assert_eq!(agent.key, "economist");
+        assert!(!agent.builtin);
+        assert_eq!(agent.role, "debater");
+
+        // Registry should now have 7 agents
+        let registry = load_registry(&app_data_dir);
+        assert_eq!(registry.len(), 7);
+
+        // Prompt file should exist
+        let prompt = read_agent_prompt(&app_data_dir, "economist");
+        assert_eq!(prompt, "Custom prompt");
+
+        // Delete custom agent
+        delete_custom_agent(&app_data_dir, "economist").expect("should delete agent");
+        let registry = load_registry(&app_data_dir);
+        assert_eq!(registry.len(), 6);
+
+        // Cannot delete builtin
+        let result = delete_custom_agent(&app_data_dir, "rationalist");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn integration_read_agent_prompt_with_override() {
+        let dir = tempdir().expect("temp directory should exist");
+        let app_data_dir = dir.path().to_path_buf();
+
+        init_agent_files(&app_data_dir).expect("agent files should initialize");
 
         write_agent_file(&app_data_dir, "rationalist.md", "custom prompt")
             .expect("agent file should write");
-        let custom_prompt = read_agent_prompt(&app_data_dir, &Agent::Rationalist);
+        let custom_prompt = read_agent_prompt(&app_data_dir, "rationalist");
         assert_eq!(custom_prompt, "custom prompt");
     }
 }

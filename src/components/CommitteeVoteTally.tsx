@@ -1,12 +1,14 @@
-import { AGENT_CONFIG } from "./DebateAgentMessage";
 import { cn } from "@/lib/utils";
+import { resolveAgentConfig } from "@/lib/agentColors";
+import type { AgentMeta } from "@/lib/agentColors";
 
 interface CommitteeVoteTallyProps {
   votes: Record<string, string>;
+  registry: AgentMeta[];
 }
 
-export default function CommitteeVoteTally({ votes }: CommitteeVoteTallyProps) {
-  const agents = ["rationalist", "advocate", "contrarian", "visionary", "pragmatist"];
+export default function CommitteeVoteTally({ votes, registry }: CommitteeVoteTallyProps) {
+  const agentKeys = Object.keys(votes);
 
   return (
     <section>
@@ -14,12 +16,12 @@ export default function CommitteeVoteTally({ votes }: CommitteeVoteTallyProps) {
         Committee Votes
       </h3>
       <div className="space-y-1.5">
-        {agents.map((agent) => {
-          const config = AGENT_CONFIG[agent];
-          const vote = votes[agent];
-          if (!config || !vote) return null;
+        {agentKeys.map((agentKey) => {
+          const config = resolveAgentConfig(agentKey, registry);
+          const vote = votes[agentKey];
+          if (!vote) return null;
           return (
-            <div key={agent} className="flex items-start gap-2 text-xs">
+            <div key={agentKey} className="flex items-start gap-2 text-xs">
               <div className="flex items-center gap-1 shrink-0 w-24">
                 <span>{config.emoji}</span>
                 <span className={cn("font-medium", config.color)}>

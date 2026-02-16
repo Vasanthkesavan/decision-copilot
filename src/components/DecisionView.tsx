@@ -4,15 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 import { Bot, PanelRightClose, PanelRightOpen, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import type { AgentMeta } from "@/lib/agentColors";
 import MessageBubble from "./MessageBubble";
 import ChatInput from "./ChatInput";
 import LoadingIndicator from "./LoadingIndicator";
@@ -20,6 +13,7 @@ import DecisionSummaryPanel, { DecisionSummary } from "./DecisionSummaryPanel";
 import DecisionChoiceModal from "./DecisionChoiceModal";
 import OutcomeModal from "./OutcomeModal";
 import DebateView from "./DebateView";
+import AgentSelectionDialog from "./AgentSelectionDialog";
 
 function buildReflectionMessage(opts: {
   title: string;
@@ -109,10 +103,11 @@ export default function DecisionView({
   );
   const [showChoiceModal, setShowChoiceModal] = useState(false);
   const [showOutcomeModal, setShowOutcomeModal] = useState(false);
-  const [showDebateConfirm, setShowDebateConfirm] = useState(false);
+  const [showAgentSelection, setShowAgentSelection] = useState(false);
   const [debateQuickMode, setDebateQuickMode] = useState(false);
   const [debateActive, setDebateActive] = useState(false);
   const [hasDebateRounds, setHasDebateRounds] = useState(false);
+  const [registry, setRegistry] = useState<AgentMeta[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const streamingContentRef = useRef("");
 
@@ -131,12 +126,13 @@ export default function DecisionView({
     }
   }, [status]);
 
-  // Load decision data
+  // Load decision data and agent registry
   useEffect(() => {
     setMobileTab("chat");
     setDebateActive(false);
     loadDecision();
     loadMessages();
+    invoke<AgentMeta[]>("get_agent_registry").then(setRegistry).catch(console.error);
     // Check if debate rounds exist in DB
     invoke<{ id: string }[]>("get_debate", { decisionId }).then((rounds) => {
       setHasDebateRounds(rounds.length > 0);
@@ -414,10 +410,10 @@ export default function DecisionView({
     }
   }
 
-  async function handleStartDebate(quick: boolean) {
-    setShowDebateConfirm(false);
+  async function handleStartDebate(quick: boolean, selectedAgents: string[]) {
+    setShowAgentSelection(false);
     try {
-      await invoke("start_debate", { decisionId, quickMode: quick });
+      await invoke("start_debate", { decisionId, quickMode: quick, selectedAgents });
     } catch (err) {
       setError(typeof err === "string" ? err : "Failed to start debate.");
     }
@@ -501,7 +497,7 @@ export default function DecisionView({
             variant="outline"
             size="sm"
             className="w-full gap-2"
-            onClick={() => setShowDebateConfirm(true)}
+            onClick={() => setShowAgentSelection(true)}
           >
             <Users className="h-3.5 w-3.5" />
             Send to Committee
@@ -562,6 +558,7 @@ export default function DecisionView({
       onLogOutcome={handleLogOutcome}
       onReopen={handleReopenDecision}
       onCancelDebate={handleCancelDebate}
+      registry={registry}
     />
   );
 
@@ -690,50 +687,16 @@ export default function DecisionView({
         />
       )}
 
-      {/* Debate Confirmation Dialog */}
-      {showDebateConfirm && (
-        <Dialog open onOpenChange={(open) => !open && setShowDebateConfirm(false)}>
-          <DialogContent className="sm:max-w-md">
-            <DialogHeader>
-              <DialogTitle>Send to Committee</DialogTitle>
-              <DialogDescription>
-                Five AI agents with different perspectives will debate your decision
-                and a moderator will synthesize a recommendation.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="space-y-3 py-2">
-              <button
-                onClick={() => {
-                  setDebateQuickMode(false);
-                  handleStartDebate(false);
-                }}
-                className="w-full text-left p-3 rounded-lg border border-border hover:bg-muted/50 transition-colors"
-              >
-                <div className="font-medium text-sm">Full Debate</div>
-                <div className="text-xs text-muted-foreground mt-0.5">
-                  3 rounds of debate + synthesis. More thorough.
-                </div>
-              </button>
-              <button
-                onClick={() => {
-                  setDebateQuickMode(true);
-                  handleStartDebate(true);
-                }}
-                className="w-full text-left p-3 rounded-lg border border-border hover:bg-muted/50 transition-colors"
-              >
-                <div className="font-medium text-sm">Quick Take</div>
-                <div className="text-xs text-muted-foreground mt-0.5">
-                  Opening positions + synthesis only. Faster.
-                </div>
-              </button>
-            </div>
-            <DialogFooter>
-              <Button variant="ghost" onClick={() => setShowDebateConfirm(false)}>
-                Cancel
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+      {/* Agent Selection Dialog */}
+      {showAgentSelection && (
+        <AgentSelectionDialog
+          agents={registry}
+          onStart={(quickMode, selectedAgents) => {
+            setDebateQuickMode(quickMode);
+            handleStartDebate(quickMode, selectedAgents);
+          }}
+          onClose={() => setShowAgentSelection(false)}
+        />
       )}
     </div>
   );

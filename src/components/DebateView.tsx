@@ -8,6 +8,7 @@ import DebateAgentMessage from "./DebateAgentMessage";
 import DebateRoundHeader from "./DebateRoundHeader";
 import DebateProgressBar from "./DebateProgressBar";
 import ModeratorVerdict from "./ModeratorVerdict";
+import type { AgentMeta } from "@/lib/agentColors";
 
 interface DebateRoundData {
   id: string;
@@ -96,13 +97,15 @@ export default function DebateView({
   const [streamingMessages, setStreamingMessages] = useState<Record<string, { round_number: number; exchange_number: number; agent: string; content: string }>>(
     {}
   );
+  const [registry, setRegistry] = useState<AgentMeta[]>([]);
 
   // Total rounds: quick mode = 2 (round 1 + moderator), full = 5 (r1, r2e1, r2e2, r3, moderator)
   const totalRounds = quickMode ? 2 : 5;
 
-  // Load existing debate data on mount
+  // Load existing debate data and agent registry on mount
   useEffect(() => {
     loadDebate();
+    invoke<AgentMeta[]>("get_agent_registry").then(setRegistry).catch(console.error);
   }, [decisionId]);
 
   // Listen for debate events
@@ -338,6 +341,7 @@ export default function DebateView({
                           key={entry.id}
                           agent={entry.agent}
                           content={entry.content}
+                          registry={registry}
                         />
                       )
                     )}
@@ -354,6 +358,7 @@ export default function DebateView({
                           agent={msg.agent}
                           content={msg.content}
                           isStreaming
+                          registry={registry}
                         />
                       )
                     )}

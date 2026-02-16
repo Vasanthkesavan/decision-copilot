@@ -583,3 +583,46 @@ pub async fn call_llm_streaming_debate(
 
     Ok(all_text)
 }
+
+// ── Non-streaming LLM call for simple one-shot generation (e.g. agent prompt creation) ──
+
+pub async fn call_llm_simple(
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String, String> {
+    let client = Client::new();
+    let request_body = json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 2048,
+    });
+
+    let response = client
+        .post(OPENROUTER_URL)
+        .headers(openrouter_headers(api_key))
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|e| format!("Read error: {}", e))?;
+
+    if !status.is_success() {
+        return Err(map_api_error(status, &body));
+    }
+
+    let data: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("JSON parse error: {}", e))?;
+
+    data["choices"][0]["message"]["content"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "No content in LLM response".to_string())
+}

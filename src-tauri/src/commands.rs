@@ -296,6 +296,12 @@ pub fn remove_profile_file(state: State<'_, Mutex<AppState>>, filename: String) 
 // ── Committee Agent Commands ──
 
 #[tauri::command]
+pub fn get_agent_registry(state: State<'_, Mutex<AppState>>) -> Result<Vec<agents::AgentInfo>, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    Ok(agents::load_registry(&state.app_data_dir))
+}
+
+#[tauri::command]
 pub fn get_agent_files(state: State<'_, Mutex<AppState>>) -> Result<Vec<agents::AgentFileInfo>, String> {
     let state = state.lock().map_err(|e| e.to_string())?;
     agents::read_all_agent_files(&state.app_data_dir)
@@ -344,6 +350,44 @@ pub fn open_agents_folder(state: State<'_, Mutex<AppState>>) -> Result<String, S
     Ok(dir.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+pub async fn create_custom_agent(
+    state: State<'_, Mutex<AppState>>,
+    label: String,
+    emoji: String,
+    description: String,
+) -> Result<agents::AgentInfo, String> {
+    // Generate prompt via LLM
+    let (api_key, model, app_data_dir) = {
+        let state = state.lock().map_err(|e| e.to_string())?;
+        let config = config::load_config(&state.app_data_dir);
+        if config.openrouter_api_key.is_empty() {
+            return Err("API key not set. Please go to Settings to add your OpenRouter API key.".to_string());
+        }
+        (config.openrouter_api_key, config.model, state.app_data_dir.clone())
+    };
+
+    let (system_prompt, user_prompt) = agents::agent_generation_prompt(&label, &description);
+    let generated_prompt = llm::call_llm_simple(&api_key, &model, &system_prompt, &user_prompt).await?;
+
+    agents::create_custom_agent(&app_data_dir, &label, &emoji, &generated_prompt)
+}
+
+#[tauri::command]
+pub fn delete_custom_agent(
+    state: State<'_, Mutex<AppState>>,
+    agent_key: String,
+) -> Result<(), String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+
+    // Also remove model override from config
+    let mut config = config::load_config(&state.app_data_dir);
+    config.agent_models.remove(&agent_key);
+    config::save_config(&state.app_data_dir, &config)?;
+
+    agents::delete_custom_agent(&state.app_data_dir, &agent_key)
+}
+
 // ── Debate Commands ──
 
 #[tauri::command]
@@ -352,6 +396,7 @@ pub async fn start_debate(
     state: State<'_, Mutex<AppState>>,
     decision_id: String,
     quick_mode: bool,
+    selected_agents: Option<Vec<String>>,
 ) -> Result<(), String> {
     {
         let state = state.lock().map_err(|e| e.to_string())?;
@@ -385,8 +430,9 @@ pub async fn start_debate(
     }
 
     let dec_id = decision_id.clone();
+    let selected = selected_agents.clone();
     tokio::spawn(async move {
-        if let Err(e) = debate::run_debate(app_handle.clone(), dec_id.clone(), quick_mode, cancel_flag).await {
+        if let Err(e) = debate::run_debate(app_handle.clone(), dec_id.clone(), quick_mode, cancel_flag, selected).await {
             eprintln!("Debate error: {}", e);
             let _ = tauri::Emitter::emit(&app_handle, "debate-error", serde_json::json!({
                 "decision_id": dec_id,

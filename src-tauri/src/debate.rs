@@ -1,4 +1,4 @@
-use crate::agents::{self, Agent};
+use crate::agents::{self, AgentInfo};
 use crate::commands::AppState;
 use crate::config;
 use crate::decisions;
@@ -109,7 +109,7 @@ fn compile_brief(
 }
 
 /// Format the debate transcript so far for injection into prompts.
-fn format_transcript(rounds: &[crate::db::DebateRound]) -> String {
+fn format_transcript(rounds: &[crate::db::DebateRound], all_agents: &[AgentInfo]) -> String {
     let mut sections: Vec<String> = Vec::new();
     let mut current_round = -1i32;
     let mut current_exchange = -1i32;
@@ -128,12 +128,10 @@ fn format_transcript(rounds: &[crate::db::DebateRound]) -> String {
             sections.push(header);
         }
 
-        let agent = Agent::all_debaters()
-            .into_iter()
-            .find(|a| a.key() == r.agent)
-            .or_else(|| if r.agent == "moderator" { Some(Agent::Moderator) } else { None });
-
-        let label = agent.map(|a| format!("{} {}", a.emoji(), a.label())).unwrap_or_else(|| r.agent.clone());
+        let label = all_agents.iter()
+            .find(|a| a.key == r.agent)
+            .map(|a| format!("{} {}", a.emoji, a.label))
+            .unwrap_or_else(|| r.agent.clone());
         sections.push(format!("**{}**:\n{}", label, r.content));
     }
 
@@ -144,7 +142,8 @@ fn format_transcript(rounds: &[crate::db::DebateRound]) -> String {
 async fn call_agent_with_retry(
     api_key: &str,
     model: &str,
-    agent: Agent,
+    agent_key: &str,
+    agent_label: &str,
     system_prompt: &str,
     user_prompt: &str,
     max_retries: u32,
@@ -164,7 +163,7 @@ async fn call_agent_with_retry(
             decision_id,
             round_number,
             exchange_number,
-            agent.key(),
+            agent_key,
         ).await {
             Ok(text) => return Ok(text),
             Err(e) => {
@@ -175,7 +174,7 @@ async fn call_agent_with_retry(
             }
         }
     }
-    Err(format!("{} failed after {} retries: {}", agent.label(), max_retries + 1, last_err))
+    Err(format!("{} failed after {} retries: {}", agent_label, max_retries + 1, last_err))
 }
 
 /// Run a full debate round where debaters respond one at a time (sequential streaming).
@@ -191,12 +190,14 @@ async fn run_sequential_round(
     decision_id: &str,
     cancel_flag: &Arc<AtomicBool>,
     app_data_dir: &std::path::PathBuf,
+    debaters: &[AgentInfo],
+    all_agents: &[AgentInfo],
 ) -> Result<Vec<crate::db::DebateRound>, String> {
     if cancel_flag.load(Ordering::Relaxed) {
         return Err("Debate cancelled".to_string());
     }
 
-    let transcript = format_transcript(existing_rounds);
+    let transcript = format_transcript(existing_rounds, all_agents);
 
     let user_prompt = match round_number {
         1 => agents::round1_prompt(brief),
@@ -205,19 +206,18 @@ async fn run_sequential_round(
         _ => return Err("Invalid round number".to_string()),
     };
 
-    let debaters = Agent::all_debaters();
     let mut new_rounds = Vec::new();
 
-    for agent in &debaters {
+    for agent in debaters {
         if cancel_flag.load(Ordering::Relaxed) {
             return Err("Debate cancelled".to_string());
         }
 
-        let system_prompt = agent.load_prompt(app_data_dir);
-        let agent_model = agent_models.get(agent.key()).filter(|m| !m.is_empty()).map(|m| m.as_str()).unwrap_or(default_model);
+        let system_prompt = agents::read_agent_prompt(app_data_dir, &agent.key);
+        let agent_model = agent_models.get(&agent.key).filter(|m| !m.is_empty()).map(|m| m.as_str()).unwrap_or(default_model);
         let result = call_agent_with_retry(
             api_key, agent_model,
-            *agent, &system_prompt, &user_prompt, 2,
+            &agent.key, &agent.label, &system_prompt, &user_prompt, 2,
             app_handle, decision_id, round_number, exchange_number,
         ).await;
 
@@ -231,7 +231,7 @@ async fn run_sequential_round(
                         decision_id,
                         round_number,
                         exchange_number,
-                        agent.key(),
+                        &agent.key,
                         &text,
                     ).map_err(|e| e.to_string())?
                 };
@@ -241,7 +241,7 @@ async fn run_sequential_round(
                     "decision_id": decision_id,
                     "round_number": round_number,
                     "exchange_number": exchange_number,
-                    "agent": agent.key(),
+                    "agent": agent.key,
                     "content": text,
                 }));
 
@@ -276,6 +276,7 @@ pub async fn run_debate(
     decision_id: String,
     quick_mode: bool,
     cancel_flag: Arc<AtomicBool>,
+    selected_agent_keys: Option<Vec<String>>,
 ) -> Result<(), String> {
     // 1. Compile brief
     let brief = compile_brief(&app_handle, &decision_id)?;
@@ -303,6 +304,34 @@ pub async fn run_debate(
     // Ensure agent prompt files exist
     agents::init_agent_files(&app_data_dir).ok();
 
+    // Load agent registry and determine participants
+    let registry = agents::load_registry(&app_data_dir);
+    let all_debaters_in_registry: Vec<AgentInfo> = registry.iter()
+        .filter(|a| a.role == "debater")
+        .cloned()
+        .collect();
+
+    let debaters: Vec<AgentInfo> = match selected_agent_keys {
+        Some(ref keys) if !keys.is_empty() => {
+            // Use selected agents in the order they appear in the registry
+            all_debaters_in_registry.iter()
+                .filter(|a| keys.contains(&a.key))
+                .cloned()
+                .collect()
+        }
+        _ => all_debaters_in_registry,
+    };
+
+    if debaters.is_empty() {
+        return Err("No debaters selected for the debate".to_string());
+    }
+
+    // Build participant names for moderator
+    let participant_names = agents::format_participant_names(&debaters);
+
+    // All agents for transcript formatting (debaters + moderator)
+    let all_agents: Vec<AgentInfo> = registry.clone();
+
     let mut all_rounds: Vec<crate::db::DebateRound> = Vec::new();
 
     // 4. Round 1: Opening Positions
@@ -310,6 +339,7 @@ pub async fn run_debate(
         &api_key, &model, &agent_models,
         &brief, &all_rounds, 1, 1,
         &app_handle, &decision_id, &cancel_flag, &app_data_dir,
+        &debaters, &all_agents,
     ).await?;
     all_rounds.extend(round1);
 
@@ -324,6 +354,7 @@ pub async fn run_debate(
             &api_key, &model, &agent_models,
             &brief, &all_rounds, 2, 1,
             &app_handle, &decision_id, &cancel_flag, &app_data_dir,
+            &debaters, &all_agents,
         ).await?;
         all_rounds.extend(r2e1);
 
@@ -335,6 +366,7 @@ pub async fn run_debate(
             &api_key, &model, &agent_models,
             &brief, &all_rounds, 2, 2,
             &app_handle, &decision_id, &cancel_flag, &app_data_dir,
+            &debaters, &all_agents,
         ).await?;
         all_rounds.extend(r2e2);
 
@@ -346,6 +378,7 @@ pub async fn run_debate(
             &api_key, &model, &agent_models,
             &brief, &all_rounds, 3, 1,
             &app_handle, &decision_id, &cancel_flag, &app_data_dir,
+            &debaters, &all_agents,
         ).await?;
         all_rounds.extend(round3);
     }
@@ -355,14 +388,14 @@ pub async fn run_debate(
         return handle_cancellation(&app_handle, &decision_id);
     }
 
-    let transcript = format_transcript(&all_rounds);
-    let moderator_user_prompt = agents::moderator_prompt(&brief, &transcript);
-    let moderator_system_prompt = Agent::Moderator.load_prompt(&app_data_dir);
+    let transcript = format_transcript(&all_rounds, &all_agents);
+    let moderator_user_prompt = agents::moderator_prompt(&brief, &transcript, &participant_names);
+    let moderator_system_prompt = agents::read_agent_prompt(&app_data_dir, "moderator");
 
     let moderator_model = agent_models.get("moderator").filter(|m| !m.is_empty()).map(|m| m.as_str()).unwrap_or(&model);
     let moderator_response = call_agent_with_retry(
         &api_key, moderator_model,
-        Agent::Moderator, &moderator_system_prompt, &moderator_user_prompt, 2,
+        "moderator", "Moderator", &moderator_system_prompt, &moderator_user_prompt, 2,
         &app_handle, &decision_id, 99, 1,
     ).await?;
 
@@ -384,7 +417,7 @@ pub async fn run_debate(
     }));
 
     // 9. Parse moderator output and update decision summary
-    update_summary_from_debate(&app_handle, &decision_id, &all_rounds, &moderator_response)?;
+    update_summary_from_debate(&app_handle, &decision_id, &all_rounds, &moderator_response, &debaters)?;
 
     // 10. Mark debate complete
     {
@@ -410,23 +443,23 @@ fn handle_cancellation(app_handle: &tauri::AppHandle, decision_id: &str) -> Resu
     Ok(())
 }
 
-/// Extract final votes from Round 3 and build debate_summary for the decision.
+/// Extract final votes from the last round and build debate_summary for the decision.
 fn update_summary_from_debate(
     app_handle: &tauri::AppHandle,
     decision_id: &str,
     all_rounds: &[crate::db::DebateRound],
     moderator_response: &str,
+    debaters: &[AgentInfo],
 ) -> Result<(), String> {
     let mut final_votes = serde_json::Map::new();
-    let debaters = Agent::all_debaters();
 
-    for agent in &debaters {
+    for agent in debaters {
         let last_entry = all_rounds.iter()
-            .filter(|r| r.agent == agent.key())
+            .filter(|r| r.agent == agent.key)
             .last();
         if let Some(entry) = last_entry {
             let vote = entry.content.chars().take(200).collect::<String>();
-            final_votes.insert(agent.key().to_string(), Value::String(vote));
+            final_votes.insert(agent.key.clone(), Value::String(vote));
         }
     }
 
