@@ -14,6 +14,7 @@ import {
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import DecisionView from "./components/DecisionView";
+import ProfileView from "./components/ProfileView";
 import Settings from "./components/Settings";
 import "./App.css";
 
@@ -34,7 +35,7 @@ interface CreateDecisionResponse {
 type Theme = "light" | "dark";
 const THEME_STORAGE_KEY = "decision-copilot-theme";
 
-type ViewMode = "chat" | "decision";
+type ViewMode = "chat" | "decision" | "profile";
 
 function getInitialTheme(): Theme {
   if (typeof window === "undefined") {
@@ -115,6 +116,10 @@ function App() {
     setNewDecisionTitle("");
   }
 
+  function handleOpenProfile() {
+    setViewMode("profile");
+  }
+
   async function handleCreateDecision() {
     const title = newDecisionTitle.trim();
     if (!title) return;
@@ -169,6 +174,7 @@ function App() {
           onNewChat={handleNewChat}
           onNewDecision={handleNewDecision}
           onOpenSettings={() => setShowSettings(true)}
+          onOpenProfile={handleOpenProfile}
           onToggleTheme={handleToggleTheme}
           onClose={() => setSidebarOpen(false)}
           theme={theme}
@@ -186,7 +192,9 @@ function App() {
             <Menu className="h-5 w-5" />
           </Button>
         )}
-        {viewMode === "decision" && currentConversationId && currentDecisionId ? (
+        {viewMode === "profile" ? (
+          <ProfileView onNavigateToChat={handleNewChat} />
+        ) : viewMode === "decision" && currentConversationId && currentDecisionId ? (
           <DecisionView
             conversationId={currentConversationId}
             decisionId={currentDecisionId}

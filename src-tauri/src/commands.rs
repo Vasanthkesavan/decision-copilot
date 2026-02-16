@@ -2,6 +2,7 @@ use crate::config::{self, AppConfig, Provider};
 use crate::db::{Database, Decision};
 use crate::llm;
 use crate::profile;
+use crate::profile::ProfileFileInfo;
 use crate::llm::StreamEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -280,4 +281,39 @@ pub fn update_decision_status(
     state.db.get_decision(&decision_id)
         .map_err(db_err)?
         .ok_or_else(|| "Decision not found after update".to_string())
+}
+
+// ── Profile Viewer Commands ──
+
+#[tauri::command]
+pub fn get_profile_files_detailed(state: State<'_, Mutex<AppState>>) -> Result<Vec<ProfileFileInfo>, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    profile::read_all_profiles_detailed(&state.app_data_dir)
+}
+
+#[tauri::command]
+pub fn update_profile_file(state: State<'_, Mutex<AppState>>, filename: String, content: String) -> Result<ProfileFileInfo, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    profile::write_profile_file(&state.app_data_dir, &filename, &content)?;
+    // Re-read to get updated metadata
+    let dir = profile::get_profile_dir(&state.app_data_dir);
+    let path = dir.join(&filename);
+    let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    let modified = metadata.modified().map_err(|e| e.to_string())?;
+    let modified_at = chrono::DateTime::<chrono::Utc>::from(modified)
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    Ok(ProfileFileInfo {
+        filename,
+        content,
+        modified_at,
+        size_bytes: metadata.len(),
+    })
+}
+
+#[tauri::command]
+pub fn remove_profile_file(state: State<'_, Mutex<AppState>>, filename: String) -> Result<(), String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    profile::delete_profile_file(&state.app_data_dir, &filename)?;
+    Ok(())
 }

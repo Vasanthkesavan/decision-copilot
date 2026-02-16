@@ -13,6 +13,7 @@ import {
   Diamond,
   Check,
   Star,
+  User,
   type LucideIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -44,6 +45,7 @@ interface SidebarProps {
   onNewChat: () => void;
   onNewDecision: () => void;
   onOpenSettings: () => void;
+  onOpenProfile: () => void;
   onToggleTheme: () => void;
   onClose: () => void;
   theme: "light" | "dark";
@@ -68,6 +70,7 @@ export default function Sidebar({
   onNewChat,
   onNewDecision,
   onOpenSettings,
+  onOpenProfile,
   onToggleTheme,
   onClose,
   theme,
@@ -276,6 +279,14 @@ export default function Sidebar({
             <Moon className="h-4 w-4" />
           )}
           {theme === "dark" ? "Light Mode" : "Dark Mode"}
+        </Button>
+        <Button
+          variant="ghost"
+          onClick={onOpenProfile}
+          className="w-full justify-start gap-2 text-sidebar-foreground/60 hover:text-sidebar-foreground hover:bg-sidebar-accent"
+        >
+          <User className="h-4 w-4" />
+          Profile
         </Button>
         <Button
           variant="ghost"

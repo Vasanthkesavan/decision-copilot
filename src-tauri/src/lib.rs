@@ -43,6 +43,9 @@ pub fn run() {
             commands::get_decision,
             commands::get_decision_by_conversation,
             commands::update_decision_status,
+            commands::get_profile_files_detailed,
+            commands::update_profile_file,
+            commands::remove_profile_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
