@@ -2,8 +2,18 @@ import { useState, useEffect, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Menu } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
+import DecisionView from "./components/DecisionView";
 import Settings from "./components/Settings";
 import "./App.css";
 
@@ -16,8 +26,15 @@ interface SettingsResponse {
   ollama_model: string;
 }
 
+interface CreateDecisionResponse {
+  conversation_id: string;
+  decision_id: string;
+}
+
 type Theme = "light" | "dark";
 const THEME_STORAGE_KEY = "decision-copilot-theme";
+
+type ViewMode = "chat" | "decision";
 
 function getInitialTheme(): Theme {
   if (typeof window === "undefined") {
@@ -36,7 +53,11 @@ function getInitialTheme(): Theme {
 
 function App() {
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
+  const [currentDecisionId, setCurrentDecisionId] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>("chat");
   const [showSettings, setShowSettings] = useState(false);
+  const [showNewDecisionInput, setShowNewDecisionInput] = useState(false);
+  const [newDecisionTitle, setNewDecisionTitle] = useState("");
   const [apiKeySet, setApiKeySet] = useState<boolean | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -73,10 +94,42 @@ function App() {
 
   function handleNewChat() {
     setCurrentConversationId(null);
+    setCurrentDecisionId(null);
+    setViewMode("chat");
   }
 
   function handleSelectConversation(id: string) {
     setCurrentConversationId(id);
+    setCurrentDecisionId(null);
+    setViewMode("chat");
+  }
+
+  function handleSelectDecision(conversationId: string, decisionId: string) {
+    setCurrentConversationId(conversationId);
+    setCurrentDecisionId(decisionId);
+    setViewMode("decision");
+  }
+
+  function handleNewDecision() {
+    setShowNewDecisionInput(true);
+    setNewDecisionTitle("");
+  }
+
+  async function handleCreateDecision() {
+    const title = newDecisionTitle.trim();
+    if (!title) return;
+
+    try {
+      const result = await invoke<CreateDecisionResponse>("create_decision", { title });
+      setCurrentConversationId(result.conversation_id);
+      setCurrentDecisionId(result.decision_id);
+      setViewMode("decision");
+      setShowNewDecisionInput(false);
+      setNewDecisionTitle("");
+      setRefreshKey((k) => k + 1);
+    } catch (err) {
+      console.error("Failed to create decision:", err);
+    }
   }
 
   function handleSettingsSaved() {
@@ -112,7 +165,9 @@ function App() {
         <Sidebar
           currentConversationId={currentConversationId}
           onSelectConversation={handleSelectConversation}
+          onSelectDecision={handleSelectDecision}
           onNewChat={handleNewChat}
+          onNewDecision={handleNewDecision}
           onOpenSettings={() => setShowSettings(true)}
           onToggleTheme={handleToggleTheme}
           onClose={() => setSidebarOpen(false)}
@@ -131,12 +186,21 @@ function App() {
             <Menu className="h-5 w-5" />
           </Button>
         )}
-        <ChatView
-          conversationId={currentConversationId}
-          onConversationCreated={handleConversationCreated}
-          onMessageSent={handleMessageSent}
-          activeModel={activeModel}
-        />
+        {viewMode === "decision" && currentConversationId && currentDecisionId ? (
+          <DecisionView
+            conversationId={currentConversationId}
+            decisionId={currentDecisionId}
+            onMessageSent={handleMessageSent}
+            activeModel={activeModel}
+          />
+        ) : (
+          <ChatView
+            conversationId={currentConversationId}
+            onConversationCreated={handleConversationCreated}
+            onMessageSent={handleMessageSent}
+            activeModel={activeModel}
+          />
+        )}
       </div>
       {showSettings && (
         <Settings
@@ -146,6 +210,43 @@ function App() {
           onSaved={handleSettingsSaved}
           mustSetKey={!apiKeySet}
         />
+      )}
+
+      {/* New Decision Modal */}
+      {showNewDecisionInput && (
+        <Dialog open onOpenChange={(open) => !open && setShowNewDecisionInput(false)}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>New Decision</DialogTitle>
+              <DialogDescription>
+                What decision are you working through?
+              </DialogDescription>
+            </DialogHeader>
+            <Input
+              value={newDecisionTitle}
+              onChange={(e) => setNewDecisionTitle(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleCreateDecision();
+              }}
+              placeholder="e.g., Should I leave my job?"
+              autoFocus
+            />
+            <DialogFooter>
+              <Button
+                variant="ghost"
+                onClick={() => setShowNewDecisionInput(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={handleCreateDecision}
+                disabled={!newDecisionTitle.trim()}
+              >
+                Start
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
     </div>
   );

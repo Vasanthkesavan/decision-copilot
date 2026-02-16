@@ -1,10 +1,14 @@
+use crate::commands::AppState;
 use crate::config::Provider;
+use crate::decisions;
 use crate::profile;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tauri::ipc::Channel;
+use tauri::{Emitter, Manager};
 
 const SYSTEM_PROMPT: &str = r#"You are a personal decision-making assistant. Your primary job right now is to deeply understand the user — who they are, what they value, what their life situation looks like, and what matters most to them.
 
@@ -30,6 +34,55 @@ When you have enough context about the user and they bring you a decision to mak
 
 But for now, focus on learning about the user. The better you understand them, the better your future recommendations will be."#;
 
+const DECISION_SYSTEM_PROMPT: &str = r#"You are a personal decision-making assistant. The user is working through a specific decision and needs your help analyzing it thoroughly.
+
+You have access to the user's profile files — markdown files that contain everything you've learned about them: their values, priorities, life situation, constraints, finances, career, family, and goals. READ THESE FIRST before engaging with the decision.
+
+Your job is to:
+
+1. UNDERSTAND THE DECISION
+   - What are they deciding between? (Surface all options, including ones they haven't considered)
+   - What's the timeline? Is this reversible?
+   - What triggered this decision now?
+
+2. MAP ALL VARIABLES
+   - What factors are at play? (financial, career, emotional, relational, health, etc.)
+   - What are the second and third-order effects of each option?
+   - What are they not seeing? What blind spots might they have?
+   - What assumptions are they making?
+
+3. ANALYZE AGAINST THEIR PROFILE
+   - How does each option align with their stated values and priorities?
+   - How does each option interact with their current constraints (financial, family, etc.)?
+   - What does their risk tolerance suggest?
+   - What would matter most to them based on what you know?
+
+4. RECOMMEND
+   - Give a CLEAR, COMMITTED recommendation. Do not hedge with "it depends" or "only you can decide."
+   - Explain your reasoning transparently — which values and factors drove the recommendation
+   - Explicitly state what they'd be giving up with your recommended choice
+   - Rate your confidence (high/medium/low) and explain why
+
+5. UPDATE THE DECISION SUMMARY
+   After each significant exchange, update the decision summary by calling the `update_decision_summary` tool. This populates the structured panel the user sees alongside the chat. Update it progressively — don't wait until the end.
+
+Guidelines:
+- Ask focused questions, one or two at a time. Don't overwhelm.
+- Push back if the user is framing the decision too narrowly ("should I quit?" is rarely binary)
+- Name cognitive biases if you spot them (sunk cost, anchoring, status quo bias, etc.)
+- Be honest even if it's not what they want to hear
+- If you don't have enough information from the profile files, ask for it
+- If new information emerges that should be saved to the profile, update the profile files too
+
+6. REFLECT ON OUTCOMES
+   When you see a message starting with "[DECISION OUTCOME LOGGED]", the user has reported how their decision turned out. This is a critical learning moment:
+
+   a) READ PROFILE FILES first to understand the full context of who this person is
+   b) COMPARE: your recommendation vs. what the user chose vs. what actually happened
+   c) ANALYZE: factors you over/underweighted, biases at play, what the user's intuition captured that your analysis missed (or vice versa), unpredictable external factors vs foreseeable outcomes
+   d) UPDATE PROFILE FILES with lessons learned — create or update a "decision-patterns.md" file tracking what works for this user and what doesn't, and update other relevant profiles if the outcome reveals new info about their values, risk tolerance, or priorities. Be specific — e.g. "user's read on organizational culture tends to be more reliable than quantitative analysis" rather than "user trusts gut feelings"
+   e) SHARE your reflection transparently in the chat. Be honest about what you got right, what you got wrong, and how this will change your future recommendations for this user"#;
+
 // ── Stream event sent to frontend via Channel ──
 
 #[derive(Clone, Serialize)]
@@ -43,8 +96,8 @@ pub enum StreamEvent {
 
 // ── Anthropic tool format ──
 
-fn get_anthropic_tools() -> Value {
-    json!([
+fn get_anthropic_tools(is_decision: bool) -> Value {
+    let mut tools = json!([
         {
             "name": "read_profile_files",
             "description": "Read the list of all profile files and their contents. Call this at the start of conversations to refresh your memory about the user.",
@@ -86,13 +139,86 @@ fn get_anthropic_tools() -> Value {
                 "required": ["filename"]
             }
         }
-    ])
+    ]);
+
+    if is_decision {
+        if let Some(arr) = tools.as_array_mut() {
+            arr.push(json!({
+                "name": "update_decision_summary",
+                "description": "Update the structured decision summary panel. Call this after each significant exchange to keep the summary current. You can update any combination of fields. Arrays are merged by key — new items are appended, existing items (matched by label/option) are updated.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "options": {
+                            "type": "array",
+                            "description": "The options being considered",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string" },
+                                    "description": { "type": "string" }
+                                },
+                                "required": ["label"]
+                            }
+                        },
+                        "variables": {
+                            "type": "array",
+                            "description": "Key variables/factors at play",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string" },
+                                    "value": { "type": "string" },
+                                    "impact": { "type": "string", "enum": ["high", "medium", "low"] }
+                                },
+                                "required": ["label", "value"]
+                            }
+                        },
+                        "pros_cons": {
+                            "type": "array",
+                            "description": "Pros and cons per option, weighted by user's values",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "option": { "type": "string" },
+                                    "pros": { "type": "array", "items": { "type": "string" } },
+                                    "cons": { "type": "array", "items": { "type": "string" } },
+                                    "alignment_score": { "type": "integer", "minimum": 1, "maximum": 10 },
+                                    "alignment_reasoning": { "type": "string" }
+                                },
+                                "required": ["option"]
+                            }
+                        },
+                        "recommendation": {
+                            "type": "object",
+                            "description": "The AI's final recommendation",
+                            "properties": {
+                                "choice": { "type": "string" },
+                                "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+                                "reasoning": { "type": "string" },
+                                "tradeoffs": { "type": "string" },
+                                "next_steps": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "required": ["choice", "confidence", "reasoning"]
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "Update the decision status",
+                            "enum": ["exploring", "analyzing", "recommended"]
+                        }
+                    }
+                }
+            }));
+        }
+    }
+
+    tools
 }
 
 // ── Ollama/OpenAI tool format ──
 
-fn get_ollama_tools() -> Value {
-    json!([
+fn get_ollama_tools(is_decision: bool) -> Value {
+    let mut tools = json!([
         {
             "type": "function",
             "function": {
@@ -143,7 +269,78 @@ fn get_ollama_tools() -> Value {
                 }
             }
         }
-    ])
+    ]);
+
+    if is_decision {
+        if let Some(arr) = tools.as_array_mut() {
+            arr.push(json!({
+                "type": "function",
+                "function": {
+                    "name": "update_decision_summary",
+                    "description": "Update the structured decision summary panel. Call this after each significant exchange to keep the summary current.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "options": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": { "type": "string" },
+                                        "description": { "type": "string" }
+                                    },
+                                    "required": ["label"]
+                                }
+                            },
+                            "variables": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": { "type": "string" },
+                                        "value": { "type": "string" },
+                                        "impact": { "type": "string" }
+                                    },
+                                    "required": ["label", "value"]
+                                }
+                            },
+                            "pros_cons": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "option": { "type": "string" },
+                                        "pros": { "type": "array", "items": { "type": "string" } },
+                                        "cons": { "type": "array", "items": { "type": "string" } },
+                                        "alignment_score": { "type": "integer" },
+                                        "alignment_reasoning": { "type": "string" }
+                                    },
+                                    "required": ["option"]
+                                }
+                            },
+                            "recommendation": {
+                                "type": "object",
+                                "properties": {
+                                    "choice": { "type": "string" },
+                                    "confidence": { "type": "string" },
+                                    "reasoning": { "type": "string" },
+                                    "tradeoffs": { "type": "string" },
+                                    "next_steps": { "type": "array", "items": { "type": "string" } }
+                                },
+                                "required": ["choice", "confidence", "reasoning"]
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["exploring", "analyzing", "recommended"]
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+    }
+
+    tools
 }
 
 // ── Ollama response types (used for tool-call parsing) ──
@@ -161,7 +358,13 @@ struct OllamaFunctionCall {
 
 // ── Shared tool execution ──
 
-fn execute_tool(name: &str, input: &Value, app_data_dir: &PathBuf) -> String {
+fn execute_tool(
+    name: &str,
+    input: &Value,
+    app_data_dir: &PathBuf,
+    decision_id: Option<&str>,
+    app_handle: &tauri::AppHandle,
+) -> String {
     match name {
         "read_profile_files" => {
             match profile::read_all_profiles(app_data_dir) {
@@ -184,6 +387,45 @@ fn execute_tool(name: &str, input: &Value, app_data_dir: &PathBuf) -> String {
                 Err(e) => format!("Error deleting profile: {}", e),
             }
         }
+        "update_decision_summary" => {
+            let Some(dec_id) = decision_id else {
+                return "Error: no decision context for update_decision_summary".to_string();
+            };
+            // Get current summary from DB, merge, save back
+            let state: tauri::State<'_, Mutex<AppState>> = app_handle.state();
+            let state_guard = match state.lock() {
+                Ok(s) => s,
+                Err(e) => return format!("Error locking state: {}", e),
+            };
+
+            let existing_summary = state_guard.db
+                .get_decision(dec_id)
+                .ok()
+                .flatten()
+                .and_then(|d| d.summary_json);
+
+            let merged = decisions::merge_summary(existing_summary.as_deref(), input);
+
+            if let Err(e) = state_guard.db.update_decision_summary(dec_id, &merged) {
+                return format!("Error saving summary: {}", e);
+            }
+
+            // Update status if provided
+            if let Some(status) = input.get("status").and_then(|v| v.as_str()) {
+                if let Err(e) = state_guard.db.update_decision_status(dec_id, status) {
+                    return format!("Error updating status: {}", e);
+                }
+            }
+
+            // Emit event to frontend
+            let _ = app_handle.emit("decision-summary-updated", json!({
+                "decision_id": dec_id,
+                "summary": merged,
+                "status": input.get("status").and_then(|v| v.as_str()),
+            }));
+
+            "Decision summary updated successfully.".to_string()
+        }
         _ => format!("Unknown tool: {}", name),
     }
 }
@@ -198,10 +440,13 @@ pub async fn send_message(
     messages: Vec<Value>,
     app_data_dir: &PathBuf,
     on_event: &Channel<StreamEvent>,
+    conv_type: &str,
+    decision_id: Option<&str>,
+    app_handle: &tauri::AppHandle,
 ) -> Result<String, String> {
     match provider {
-        Provider::Anthropic => send_to_anthropic(api_key, model, messages, app_data_dir, on_event).await,
-        Provider::Ollama => send_to_ollama(ollama_url, model, messages, app_data_dir, on_event).await,
+        Provider::Anthropic => send_to_anthropic(api_key, model, messages, app_data_dir, on_event, conv_type, decision_id, app_handle).await,
+        Provider::Ollama => send_to_ollama(ollama_url, model, messages, app_data_dir, on_event, conv_type, decision_id, app_handle).await,
     }
 }
 
@@ -213,17 +458,22 @@ async fn send_to_anthropic(
     messages: Vec<Value>,
     app_data_dir: &PathBuf,
     on_event: &Channel<StreamEvent>,
+    conv_type: &str,
+    decision_id: Option<&str>,
+    app_handle: &tauri::AppHandle,
 ) -> Result<String, String> {
     let client = Client::new();
     let mut current_messages = messages;
     let mut all_text = String::new();
+    let is_decision = conv_type == "decision";
+    let system_prompt = if is_decision { DECISION_SYSTEM_PROMPT } else { SYSTEM_PROMPT };
 
     loop {
         let request_body = json!({
             "model": model,
             "max_tokens": 4096,
-            "system": SYSTEM_PROMPT,
-            "tools": get_anthropic_tools(),
+            "system": system_prompt,
+            "tools": get_anthropic_tools(is_decision),
             "messages": current_messages,
             "stream": true,
         });
@@ -342,7 +592,7 @@ async fn send_to_anthropic(
                 "name": name,
                 "input": input,
             }));
-            let result = execute_tool(name, input, app_data_dir);
+            let result = execute_tool(name, input, app_data_dir, decision_id, app_handle);
             tool_results.push(json!({
                 "type": "tool_result",
                 "tool_use_id": id,
@@ -363,12 +613,17 @@ async fn send_to_ollama(
     messages: Vec<Value>,
     app_data_dir: &PathBuf,
     on_event: &Channel<StreamEvent>,
+    conv_type: &str,
+    decision_id: Option<&str>,
+    app_handle: &tauri::AppHandle,
 ) -> Result<String, String> {
     let client = Client::new();
     let url = format!("{}/api/chat", ollama_url.trim_end_matches('/'));
+    let is_decision = conv_type == "decision";
+    let system_prompt = if is_decision { DECISION_SYSTEM_PROMPT } else { SYSTEM_PROMPT };
 
     let mut ollama_messages: Vec<Value> = vec![
-        json!({"role": "system", "content": SYSTEM_PROMPT}),
+        json!({"role": "system", "content": system_prompt}),
     ];
     for msg in &messages {
         ollama_messages.push(msg.clone());
@@ -380,7 +635,7 @@ async fn send_to_ollama(
         let request_body = json!({
             "model": model,
             "messages": ollama_messages,
-            "tools": get_ollama_tools(),
+            "tools": get_ollama_tools(is_decision),
             "stream": true,
         });
 
@@ -465,7 +720,7 @@ async fn send_to_ollama(
         }));
 
         for tc in &tool_calls {
-            let result = execute_tool(&tc.function.name, &tc.function.arguments, app_data_dir);
+            let result = execute_tool(&tc.function.name, &tc.function.arguments, app_data_dir, decision_id, app_handle);
             ollama_messages.push(json!({
                 "role": "tool",
                 "content": result,

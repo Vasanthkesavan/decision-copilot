@@ -1,5 +1,5 @@
 use crate::config::{self, AppConfig, Provider};
-use crate::db::Database;
+use crate::db::{Database, Decision};
 use crate::llm;
 use crate::profile;
 use crate::llm::StreamEvent;
@@ -31,18 +31,25 @@ pub struct SettingsResponse {
     pub ollama_model: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateDecisionResponse {
+    pub conversation_id: String,
+    pub decision_id: String,
+}
+
 fn db_err(e: rusqlite::Error) -> String {
     e.to_string()
 }
 
 #[tauri::command]
 pub async fn send_message(
+    app_handle: tauri::AppHandle,
     state: State<'_, Mutex<AppState>>,
     conversation_id: Option<String>,
     message: String,
     on_event: Channel<StreamEvent>,
 ) -> Result<SendMessageResponse, String> {
-    let (provider, api_key, model, ollama_url, conv_id, history_messages) = {
+    let (provider, api_key, model, ollama_url, conv_id, history_messages, conv_type, decision_id) = {
         let state = state.lock().map_err(|e| e.to_string())?;
         let config = config::load_config(&state.app_data_dir);
 
@@ -83,7 +90,19 @@ pub async fn send_message(
             Provider::Ollama => config.ollama_model.clone(),
         };
 
-        (config.provider, config.api_key, active_model, config.ollama_url, conv_id, history)
+        // Determine conversation type and get decision_id if applicable
+        let conv = state.db.get_conversation(&conv_id).map_err(db_err)?;
+        let conv_type = conv.map(|c| c.conv_type).unwrap_or_else(|| "chat".to_string());
+
+        let decision_id = if conv_type == "decision" {
+            state.db.get_decision_by_conversation(&conv_id)
+                .map_err(db_err)?
+                .map(|d| d.id)
+        } else {
+            None
+        };
+
+        (config.provider, config.api_key, active_model, config.ollama_url, conv_id, history, conv_type, decision_id)
     };
 
     let app_data_dir = {
@@ -99,6 +118,9 @@ pub async fn send_message(
         history_messages,
         &app_data_dir,
         &on_event,
+        &conv_type,
+        decision_id.as_deref(),
+        &app_handle,
     ).await?;
 
     {
@@ -115,7 +137,7 @@ pub async fn send_message(
 #[tauri::command]
 pub fn get_conversations(state: State<'_, Mutex<AppState>>) -> Result<Vec<crate::db::Conversation>, String> {
     let state = state.lock().map_err(|e| e.to_string())?;
-    state.db.get_conversations().map_err(db_err)
+    state.db.get_conversations_by_type("chat").map_err(db_err)
 }
 
 #[tauri::command]
@@ -193,4 +215,69 @@ pub fn open_profile_folder(state: State<'_, Mutex<AppState>>) -> Result<String, 
 pub fn delete_conversation(state: State<'_, Mutex<AppState>>, conversation_id: String) -> Result<(), String> {
     let state = state.lock().map_err(|e| e.to_string())?;
     state.db.delete_conversation(&conversation_id).map_err(db_err)
+}
+
+// ── Decision Commands ──
+
+#[tauri::command]
+pub fn create_decision(state: State<'_, Mutex<AppState>>, title: String) -> Result<CreateDecisionResponse, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    let conv = state.db.create_conversation_with_type(&title, "decision").map_err(db_err)?;
+    let decision = state.db.create_decision(&conv.id, &title).map_err(db_err)?;
+    Ok(CreateDecisionResponse {
+        conversation_id: conv.id,
+        decision_id: decision.id,
+    })
+}
+
+#[tauri::command]
+pub fn get_decisions(state: State<'_, Mutex<AppState>>) -> Result<Vec<Decision>, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    state.db.get_decisions().map_err(db_err)
+}
+
+#[tauri::command]
+pub fn get_decision(state: State<'_, Mutex<AppState>>, decision_id: String) -> Result<Decision, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    state.db.get_decision(&decision_id)
+        .map_err(db_err)?
+        .ok_or_else(|| "Decision not found".to_string())
+}
+
+#[tauri::command]
+pub fn get_decision_by_conversation(state: State<'_, Mutex<AppState>>, conversation_id: String) -> Result<Decision, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    state.db.get_decision_by_conversation(&conversation_id)
+        .map_err(db_err)?
+        .ok_or_else(|| "Decision not found".to_string())
+}
+
+#[tauri::command]
+pub fn update_decision_status(
+    state: State<'_, Mutex<AppState>>,
+    decision_id: String,
+    status: String,
+    user_choice: Option<String>,
+    user_choice_reasoning: Option<String>,
+    outcome: Option<String>,
+) -> Result<Decision, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+
+    match status.as_str() {
+        "decided" => {
+            let choice = user_choice.ok_or("user_choice is required when status is 'decided'")?;
+            state.db.update_decision_choice(&decision_id, &choice, user_choice_reasoning.as_deref()).map_err(db_err)?;
+        }
+        "reviewed" => {
+            let outcome_text = outcome.ok_or("outcome is required when status is 'reviewed'")?;
+            state.db.update_decision_outcome(&decision_id, &outcome_text).map_err(db_err)?;
+        }
+        _ => {
+            state.db.update_decision_status(&decision_id, &status).map_err(db_err)?;
+        }
+    }
+
+    state.db.get_decision(&decision_id)
+        .map_err(db_err)?
+        .ok_or_else(|| "Decision not found after update".to_string())
 }

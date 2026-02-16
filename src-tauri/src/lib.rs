@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod db;
+mod decisions;
 mod llm;
 mod profile;
 
@@ -37,6 +38,11 @@ pub fn run() {
             commands::get_profile_files,
             commands::open_profile_folder,
             commands::delete_conversation,
+            commands::create_decision,
+            commands::get_decisions,
+            commands::get_decision,
+            commands::get_decision_by_conversation,
+            commands::update_decision_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
