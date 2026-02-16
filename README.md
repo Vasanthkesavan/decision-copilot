@@ -82,6 +82,26 @@ ollama pull llama3.1:8b
 - `npm run test:backend:e2e` - backend e2e tests (Cargo)
 - `npm run test:all` - run frontend + backend test suites
 
+## Automated Release Binaries
+
+GitHub Actions builds and uploads Windows/macOS/Linux binaries only when a release is published.
+
+Workflow:
+- `.github/workflows/release.yml`
+- Trigger: `release.published`
+- Output: release assets attached to that published release
+
+Signing:
+- No code-signing or notarization is configured in CI.
+- Assets are generated unsigned for all platforms.
+
+Release steps:
+1. Update `version` in `src-tauri/tauri.conf.json` (and keep `package.json` version aligned).
+2. Commit and push to `main`.
+3. Create a Git tag (example: `v0.2.0`) and push it.
+4. Create a GitHub Release from that tag and publish it.
+5. The workflow builds all targets and uploads artifacts to that release.
+
 ## Local App Data
 
 On Windows, app data is stored under:
