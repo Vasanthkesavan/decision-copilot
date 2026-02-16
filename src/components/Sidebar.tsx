@@ -14,6 +14,7 @@ import {
   Check,
   Star,
   User,
+  MessagesSquare,
   type LucideIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -58,6 +59,7 @@ const STATUS_ICONS: Record<
 > = {
   exploring: { Icon: Circle, color: "text-muted-foreground", label: "Exploring" },
   analyzing: { Icon: Disc, color: "text-blue-500", label: "Analyzing" },
+  debating: { Icon: MessagesSquare, color: "text-cyan-500", label: "Debating" },
   recommended: { Icon: Diamond, color: "text-amber-500", label: "Recommended" },
   decided: { Icon: Check, color: "text-green-500", label: "Decided" },
   reviewed: { Icon: Star, color: "text-purple-500", label: "Reviewed" },

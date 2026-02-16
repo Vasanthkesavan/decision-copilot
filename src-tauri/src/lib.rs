@@ -1,6 +1,8 @@
+mod agents;
 mod commands;
 mod config;
 mod db;
+mod debate;
 mod decisions;
 mod llm;
 mod profile;
@@ -25,6 +27,7 @@ pub fn run() {
             app.manage(Mutex::new(AppState {
                 db: database,
                 app_data_dir,
+                debate_cancel_flags: std::collections::HashMap::new(),
             }));
 
             Ok(())
@@ -46,6 +49,9 @@ pub fn run() {
             commands::get_profile_files_detailed,
             commands::update_profile_file,
             commands::remove_profile_file,
+            commands::start_debate,
+            commands::get_debate,
+            commands::cancel_debate,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

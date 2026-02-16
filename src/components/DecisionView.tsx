@@ -1,9 +1,17 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Bot, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { Bot, PanelRightClose, PanelRightOpen, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import MessageBubble from "./MessageBubble";
 import ChatInput from "./ChatInput";
@@ -11,6 +19,7 @@ import LoadingIndicator from "./LoadingIndicator";
 import DecisionSummaryPanel, { DecisionSummary } from "./DecisionSummaryPanel";
 import DecisionChoiceModal from "./DecisionChoiceModal";
 import OutcomeModal from "./OutcomeModal";
+import DebateView from "./DebateView";
 
 function buildReflectionMessage(opts: {
   title: string;
@@ -92,7 +101,7 @@ export default function DecisionView({
   const [outcome, setOutcome] = useState<string | null>(null);
   const [outcomeDate, setOutcomeDate] = useState<string | null>(null);
   const [showSummaryPanel, setShowSummaryPanel] = useState(true);
-  const [mobileTab, setMobileTab] = useState<"chat" | "summary">("chat");
+  const [mobileTab, setMobileTab] = useState<"chat" | "debate" | "summary">("chat");
   const [isDesktop, setIsDesktop] = useState(() =>
     typeof window !== "undefined"
       ? window.matchMedia("(min-width: 1024px)").matches
@@ -100,14 +109,38 @@ export default function DecisionView({
   );
   const [showChoiceModal, setShowChoiceModal] = useState(false);
   const [showOutcomeModal, setShowOutcomeModal] = useState(false);
+  const [showDebateConfirm, setShowDebateConfirm] = useState(false);
+  const [debateQuickMode, setDebateQuickMode] = useState(false);
+  const [debateActive, setDebateActive] = useState(false);
+  const [hasDebateRounds, setHasDebateRounds] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const streamingContentRef = useRef("");
+
+  // Check if summary has enough data to start a debate
+  const canStartDebate =
+    (status === "analyzing" || status === "exploring") &&
+    summary?.options &&
+    summary.options.length > 0 &&
+    summary?.variables &&
+    summary.variables.length > 0;
+
+  // Auto-activate debate view when status is debating
+  useEffect(() => {
+    if (status === "debating") {
+      setDebateActive(true);
+    }
+  }, [status]);
 
   // Load decision data
   useEffect(() => {
     setMobileTab("chat");
+    setDebateActive(false);
     loadDecision();
     loadMessages();
+    // Check if debate rounds exist in DB
+    invoke<{ id: string }[]>("get_debate", { decisionId }).then((rounds) => {
+      setHasDebateRounds(rounds.length > 0);
+    }).catch(() => {});
   }, [decisionId, conversationId]);
 
   // Listen for summary updates from backend
@@ -132,6 +165,44 @@ export default function DecisionView({
       unlisten.then((fn) => fn());
     };
   }, [decisionId]);
+
+  // Listen for debate status events
+  useEffect(() => {
+    const unlistenStarted = listen<{ decision_id: string }>(
+      "debate-started",
+      (event) => {
+        if (event.payload.decision_id === decisionId) {
+          setStatus("debating");
+          setDebateActive(true);
+          onMessageSent();
+        }
+      }
+    );
+    const unlistenComplete = listen<{ decision_id: string }>(
+      "debate-complete",
+      (event) => {
+        if (event.payload.decision_id === decisionId) {
+          setHasDebateRounds(true);
+          loadDecision();
+          onMessageSent();
+        }
+      }
+    );
+    const unlistenError = listen<{ decision_id: string; error: string }>(
+      "debate-error",
+      (event) => {
+        if (event.payload.decision_id === decisionId) {
+          loadDecision();
+          onMessageSent();
+        }
+      }
+    );
+    return () => {
+      unlistenStarted.then((fn) => fn());
+      unlistenComplete.then((fn) => fn());
+      unlistenError.then((fn) => fn());
+    };
+  }, [decisionId, onMessageSent]);
 
   // Auto-scroll
   useEffect(() => {
@@ -166,6 +237,17 @@ export default function DecisionView({
         }
       } else {
         setSummary(null);
+      }
+      // Auto-show debate view if status is debating or has completed debate data
+      if (dec.status === "debating") {
+        setDebateActive(true);
+      } else if (dec.summary_json) {
+        try {
+          const parsed = JSON.parse(dec.summary_json);
+          if (parsed.debate_summary) {
+            setDebateActive(true);
+          }
+        } catch { /* ignore */ }
       }
     } catch (err) {
       console.error("Failed to load decision:", err);
@@ -296,6 +378,7 @@ export default function DecisionView({
         status: "exploring",
       });
       await loadDecision();
+      setDebateActive(false);
       onMessageSent();
     } catch (err) {
       console.error("Failed to reopen decision:", err);
@@ -331,15 +414,44 @@ export default function DecisionView({
     }
   }
 
+  async function handleStartDebate(quick: boolean) {
+    setShowDebateConfirm(false);
+    try {
+      await invoke("start_debate", { decisionId, quickMode: quick });
+    } catch (err) {
+      setError(typeof err === "string" ? err : "Failed to start debate.");
+    }
+  }
+
+  const handleCancelDebate = useCallback(async () => {
+    try {
+      await invoke("cancel_debate", { decisionId });
+      setDebateActive(false);
+      await loadDecision();
+      onMessageSent();
+    } catch (err) {
+      console.error("Failed to cancel debate:", err);
+    }
+  }, [decisionId, onMessageSent]);
+
+  const handleDebateComplete = useCallback(() => {
+    loadDecision();
+    onMessageSent();
+  }, [onMessageSent]);
+
   const STATUS_LABELS: Record<string, { label: string; color: string }> = {
     exploring: { label: "Exploring", color: "text-muted-foreground" },
     analyzing: { label: "Analyzing", color: "text-blue-500" },
+    debating: { label: "Debating", color: "text-cyan-500" },
     recommended: { label: "Recommended", color: "text-amber-500" },
     decided: { label: "Decided", color: "text-green-500" },
     reviewed: { label: "Reviewed", color: "text-purple-500" },
   };
 
   const statusInfo = STATUS_LABELS[status] || STATUS_LABELS.exploring;
+
+  // Check if there's completed debate data to view (summary field OR actual rounds in DB)
+  const hasDebateData = summary?.debate_summary != null || hasDebateRounds;
 
   const renderChatPane = () => (
     <div className="flex-1 flex flex-col min-w-0 min-h-0">
@@ -381,6 +493,37 @@ export default function DecisionView({
           </div>
         )}
       </ScrollArea>
+
+      {/* Send to Committee button */}
+      {canStartDebate && (
+        <div className="px-4 py-2 border-t border-border bg-muted/20">
+          <Button
+            variant="outline"
+            size="sm"
+            className="w-full gap-2"
+            onClick={() => setShowDebateConfirm(true)}
+          >
+            <Users className="h-3.5 w-3.5" />
+            Send to Committee
+          </Button>
+        </div>
+      )}
+
+      {/* View debate results button (when debate completed) */}
+      {hasDebateData && !debateActive && status !== "debating" && (
+        <div className="px-4 py-2 border-t border-cyan-500/20 bg-cyan-500/5">
+          <Button
+            variant="outline"
+            size="sm"
+            className="w-full gap-2 border-cyan-500/30 text-cyan-500 hover:text-cyan-400 hover:bg-cyan-500/10"
+            onClick={() => setDebateActive(true)}
+          >
+            <Users className="h-3.5 w-3.5" />
+            View Committee Debate
+          </Button>
+        </div>
+      )}
+
       <div className="flex justify-center py-1">
         <span className="text-xs text-muted-foreground/50">
           {activeModel}
@@ -389,6 +532,21 @@ export default function DecisionView({
       <ChatInput onSend={handleSend} disabled={isLoading || isStreaming} />
     </div>
   );
+
+  const renderMainPane = () => {
+    if (debateActive) {
+      return (
+        <DebateView
+          decisionId={decisionId}
+          isDebating={status === "debating"}
+          quickMode={debateQuickMode}
+          onBackToChat={() => setDebateActive(false)}
+          onDebateComplete={handleDebateComplete}
+        />
+      );
+    }
+    return renderChatPane();
+  };
 
   const renderSummaryPane = () => (
     <DecisionSummaryPanel
@@ -403,6 +561,7 @@ export default function DecisionView({
       onNeedMoreTime={handleReopenDecision}
       onLogOutcome={handleLogOutcome}
       onReopen={handleReopenDecision}
+      onCancelDebate={handleCancelDebate}
     />
   );
 
@@ -433,14 +592,29 @@ export default function DecisionView({
 
       {/* Mobile tabs */}
       <div className="lg:hidden px-3 py-2 border-b border-border">
-        <div className="grid grid-cols-2 gap-2">
+        <div className={cn("grid gap-2", debateActive || hasDebateData ? "grid-cols-3" : "grid-cols-2")}>
           <Button
             variant={mobileTab === "chat" ? "secondary" : "ghost"}
             size="sm"
-            onClick={() => setMobileTab("chat")}
+            onClick={() => {
+              setMobileTab("chat");
+              if (debateActive && status !== "debating") setDebateActive(false);
+            }}
           >
             Chat
           </Button>
+          {(debateActive || hasDebateData) && (
+            <Button
+              variant={mobileTab === "debate" ? "secondary" : "ghost"}
+              size="sm"
+              onClick={() => {
+                setMobileTab("debate");
+                setDebateActive(true);
+              }}
+            >
+              Debate
+            </Button>
+          )}
           <Button
             variant={mobileTab === "summary" ? "secondary" : "ghost"}
             size="sm"
@@ -454,7 +628,7 @@ export default function DecisionView({
       <div className="flex-1 min-h-0">
         {isDesktop ? (
           <div className="h-full min-h-0 flex">
-            {renderChatPane()}
+            {renderMainPane()}
             {showSummaryPanel && (
               <div className="w-[340px] border-l border-border shrink-0 bg-muted/10 min-h-0">
                 {renderSummaryPane()}
@@ -466,11 +640,30 @@ export default function DecisionView({
             <div
               className={cn(
                 "flex-1 min-h-0",
-                mobileTab === "chat" ? "flex" : "hidden"
+                mobileTab === "chat" && !debateActive ? "flex" : "hidden"
               )}
             >
               {renderChatPane()}
             </div>
+            {(debateActive || hasDebateData) && (
+              <div
+                className={cn(
+                  "flex-1 min-h-0",
+                  mobileTab === "debate" ? "flex" : "hidden"
+                )}
+              >
+                <DebateView
+                  decisionId={decisionId}
+                  isDebating={status === "debating"}
+                  quickMode={debateQuickMode}
+                  onBackToChat={() => {
+                    setDebateActive(false);
+                    setMobileTab("chat");
+                  }}
+                  onDebateComplete={handleDebateComplete}
+                />
+              </div>
+            )}
             <div
               className={cn(
                 "flex-1 min-h-0 bg-muted/10",
@@ -495,6 +688,52 @@ export default function DecisionView({
           onSave={handleSaveOutcome}
           onClose={() => setShowOutcomeModal(false)}
         />
+      )}
+
+      {/* Debate Confirmation Dialog */}
+      {showDebateConfirm && (
+        <Dialog open onOpenChange={(open) => !open && setShowDebateConfirm(false)}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>Send to Committee</DialogTitle>
+              <DialogDescription>
+                Five AI agents with different perspectives will debate your decision
+                and a moderator will synthesize a recommendation.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3 py-2">
+              <button
+                onClick={() => {
+                  setDebateQuickMode(false);
+                  handleStartDebate(false);
+                }}
+                className="w-full text-left p-3 rounded-lg border border-border hover:bg-muted/50 transition-colors"
+              >
+                <div className="font-medium text-sm">Full Debate</div>
+                <div className="text-xs text-muted-foreground mt-0.5">
+                  3 rounds of debate + synthesis. More thorough.
+                </div>
+              </button>
+              <button
+                onClick={() => {
+                  setDebateQuickMode(true);
+                  handleStartDebate(true);
+                }}
+                className="w-full text-left p-3 rounded-lg border border-border hover:bg-muted/50 transition-colors"
+              >
+                <div className="font-medium text-sm">Quick Take</div>
+                <div className="text-xs text-muted-foreground mt-0.5">
+                  Opening positions + synthesis only. Faster.
+                </div>
+              </button>
+            </div>
+            <DialogFooter>
+              <Button variant="ghost" onClick={() => setShowDebateConfirm(false)}>
+                Cancel
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
     </div>
   );

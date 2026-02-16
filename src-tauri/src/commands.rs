@@ -1,12 +1,16 @@
 use crate::config::{self, AppConfig, Provider};
-use crate::db::{Database, Decision};
+use crate::db::{Database, DebateRound, Decision};
+use crate::debate;
 use crate::llm;
 use crate::profile;
 use crate::profile::ProfileFileInfo;
 use crate::llm::StreamEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri::State;
 use std::sync::Mutex;
@@ -14,6 +18,7 @@ use std::sync::Mutex;
 pub struct AppState {
     pub db: Database,
     pub app_data_dir: PathBuf,
+    pub debate_cancel_flags: HashMap<String, Arc<AtomicBool>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -315,5 +320,80 @@ pub fn update_profile_file(state: State<'_, Mutex<AppState>>, filename: String, 
 pub fn remove_profile_file(state: State<'_, Mutex<AppState>>, filename: String) -> Result<(), String> {
     let state = state.lock().map_err(|e| e.to_string())?;
     profile::delete_profile_file(&state.app_data_dir, &filename)?;
+    Ok(())
+}
+
+// ── Debate Commands ──
+
+#[tauri::command]
+pub async fn start_debate(
+    app_handle: tauri::AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    decision_id: String,
+    quick_mode: bool,
+) -> Result<(), String> {
+    // Validate that the decision exists and has enough data
+    {
+        let state = state.lock().map_err(|e| e.to_string())?;
+        let decision = state.db.get_decision(&decision_id)
+            .map_err(db_err)?
+            .ok_or_else(|| "Decision not found".to_string())?;
+
+        if let Some(ref summary_json) = decision.summary_json {
+            let summary: serde_json::Value = serde_json::from_str(summary_json)
+                .map_err(|_| "Invalid summary JSON".to_string())?;
+            let has_options = summary.get("options")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            let has_variables = summary.get("variables")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if !has_options || !has_variables {
+                return Err("Decision needs at least one option and one variable before starting a debate.".to_string());
+            }
+        } else {
+            return Err("Decision has no summary data. Chat with the AI first to build context.".to_string());
+        }
+    }
+
+    // Create cancel flag
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut state = state.lock().map_err(|e| e.to_string())?;
+        state.debate_cancel_flags.insert(decision_id.clone(), cancel_flag.clone());
+    }
+
+    // Spawn the debate as a background task
+    let dec_id = decision_id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = debate::run_debate(app_handle.clone(), dec_id.clone(), quick_mode, cancel_flag).await {
+            eprintln!("Debate error: {}", e);
+            let _ = tauri::Emitter::emit(&app_handle, "debate-error", serde_json::json!({
+                "decision_id": dec_id,
+                "error": e,
+            }));
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_debate(state: State<'_, Mutex<AppState>>, decision_id: String) -> Result<Vec<DebateRound>, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    state.db.get_debate_rounds(&decision_id).map_err(db_err)
+}
+
+#[tauri::command]
+pub fn cancel_debate(state: State<'_, Mutex<AppState>>, decision_id: String) -> Result<(), String> {
+    let mut state = state.lock().map_err(|e| e.to_string())?;
+    if let Some(flag) = state.debate_cancel_flags.get(&decision_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Reset status to analyzing
+    state.db.update_decision_status(&decision_id, "analyzing").map_err(db_err)?;
+    state.debate_cancel_flags.remove(&decision_id);
     Ok(())
 }

@@ -605,6 +605,183 @@ async fn send_to_anthropic(
     }
 }
 
+// ── Streaming LLM call for debate (emits per-token events) ──
+
+pub async fn call_llm_streaming_debate(
+    provider: &Provider,
+    api_key: &str,
+    model: &str,
+    ollama_url: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    app_handle: &tauri::AppHandle,
+    decision_id: &str,
+    round_number: i32,
+    exchange_number: i32,
+    agent_key: &str,
+) -> Result<String, String> {
+    match provider {
+        Provider::Anthropic => stream_anthropic_debate(
+            api_key, model, system_prompt, user_prompt,
+            app_handle, decision_id, round_number, exchange_number, agent_key,
+        ).await,
+        Provider::Ollama => stream_ollama_debate(
+            ollama_url, model, system_prompt, user_prompt,
+            app_handle, decision_id, round_number, exchange_number, agent_key,
+        ).await,
+    }
+}
+
+async fn stream_anthropic_debate(
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    app_handle: &tauri::AppHandle,
+    decision_id: &str,
+    round_number: i32,
+    exchange_number: i32,
+    agent_key: &str,
+) -> Result<String, String> {
+    let client = Client::new();
+    let request_body = json!({
+        "model": model,
+        "max_tokens": 2048,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+        "stream": true,
+    });
+
+    let mut response = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response.text().await.map_err(|e| format!("Read error: {}", e))?;
+        return Err(format!("API error ({}): {}", status, error_text));
+    }
+
+    let mut all_text = String::new();
+    let mut buffer = String::new();
+
+    while let Some(chunk) = response.chunk().await.map_err(|e| format!("Stream error: {}", e))? {
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(pos) = buffer.find("\n\n") {
+            let event_block = buffer[..pos].to_string();
+            buffer = buffer[pos + 2..].to_string();
+
+            let mut event_data = String::new();
+            for line in event_block.lines() {
+                if let Some(d) = line.strip_prefix("data: ") {
+                    event_data = d.to_string();
+                }
+            }
+            if event_data.is_empty() { continue; }
+
+            let data: Value = match serde_json::from_str(&event_data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if data["delta"]["type"].as_str() == Some("text_delta") {
+                if let Some(text) = data["delta"]["text"].as_str() {
+                    if !text.is_empty() {
+                        all_text.push_str(text);
+                        let _ = app_handle.emit("debate-agent-token", json!({
+                            "decision_id": decision_id,
+                            "round_number": round_number,
+                            "exchange_number": exchange_number,
+                            "agent": agent_key,
+                            "token": text,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(all_text)
+}
+
+async fn stream_ollama_debate(
+    ollama_url: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    app_handle: &tauri::AppHandle,
+    decision_id: &str,
+    round_number: i32,
+    exchange_number: i32,
+    agent_key: &str,
+) -> Result<String, String> {
+    let client = Client::new();
+    let url = format!("{}/api/chat", ollama_url.trim_end_matches('/'));
+    let request_body = json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": true,
+    });
+
+    let mut response = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Ollama connection error: {}. Is Ollama running at {}?", e, ollama_url))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response.text().await.map_err(|e| format!("Read error: {}", e))?;
+        return Err(format!("Ollama error ({}): {}", status, error_text));
+    }
+
+    let mut all_text = String::new();
+    let mut buffer = String::new();
+
+    while let Some(chunk) = response.chunk().await.map_err(|e| format!("Stream error: {}", e))? {
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim().to_string();
+            buffer = buffer[pos + 1..].to_string();
+
+            if line.is_empty() { continue; }
+
+            let data: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if let Some(content) = data["message"]["content"].as_str() {
+                if !content.is_empty() {
+                    all_text.push_str(content);
+                    let _ = app_handle.emit("debate-agent-token", json!({
+                        "decision_id": decision_id,
+                        "round_number": round_number,
+                        "exchange_number": exchange_number,
+                        "agent": agent_key,
+                        "token": content,
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(all_text)
+}
+
 // ── Ollama streaming implementation ──
 
 async fn send_to_ollama(

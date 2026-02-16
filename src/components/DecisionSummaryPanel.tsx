@@ -1,6 +1,10 @@
 import { cn } from "@/lib/utils";
 import { CheckCircle2, AlertTriangle, TrendingUp, Lightbulb } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
+import CommitteeVoteTally from "./CommitteeVoteTally";
 
 interface Option {
   label: string;
@@ -29,11 +33,19 @@ interface Recommendation {
   next_steps?: string[];
 }
 
+interface DebateSummary {
+  consensus_points?: string[];
+  key_disagreements?: string[];
+  biases_identified?: string[];
+  final_votes?: Record<string, string>;
+}
+
 export interface DecisionSummary {
   options?: Option[];
   variables?: Variable[];
   pros_cons?: ProsCons[];
   recommendation?: Recommendation;
+  debate_summary?: DebateSummary;
 }
 
 interface DecisionSummaryPanelProps {
@@ -48,6 +60,7 @@ interface DecisionSummaryPanelProps {
   onNeedMoreTime?: () => void;
   onLogOutcome?: () => void;
   onReopen?: () => void;
+  onCancelDebate?: () => void;
 }
 
 const IMPACT_COLORS: Record<string, string> = {
@@ -80,6 +93,18 @@ function AlignmentBar({ score }: { score: number }) {
   );
 }
 
+function normalizeMarkdown(content: string): string {
+  return !content.includes("\n") && content.includes("\\n")
+    ? content.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n")
+    : content;
+}
+
+const markdownTextClasses =
+  "text-muted-foreground leading-relaxed [&_p]:my-1.5 [&_strong]:font-semibold [&_a]:text-blue-600 dark:[&_a]:text-blue-400 [&_ul]:my-1.5 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:my-1.5 [&_ol]:list-decimal [&_ol]:pl-5 [&_li]:my-0.5 [&_li>p]:my-0 [&_pre]:my-2 [&_pre]:rounded-lg [&_pre]:border [&_pre]:border-border [&_pre]:bg-background [&_pre]:p-2.5 [&_pre]:overflow-x-auto [&_code:not(pre_code)]:rounded [&_code:not(pre_code)]:bg-muted/50 [&_code:not(pre_code)]:px-1 [&_code:not(pre_code)]:py-0.5 [&_code]:text-foreground/85";
+
+const markdownInlineClasses =
+  "text-foreground leading-snug [&_p]:m-0 [&_strong]:font-semibold [&_em]:italic [&_code]:text-foreground/85";
+
 export default function DecisionSummaryPanel({
   summary,
   status,
@@ -92,9 +117,10 @@ export default function DecisionSummaryPanel({
   onNeedMoreTime,
   onLogOutcome,
   onReopen,
+  onCancelDebate,
 }: DecisionSummaryPanelProps) {
   const shouldShowActions =
-    status === "recommended" || status === "decided" || status === "reviewed";
+    status === "debating" || status === "recommended" || status === "decided" || status === "reviewed";
 
   const formattedOutcomeDate = outcomeDate
     ? new Date(outcomeDate).toLocaleDateString(undefined, {
@@ -244,9 +270,13 @@ export default function DecisionSummaryPanel({
                 </h3>
                 <div className="p-4 rounded-lg border-2 border-primary/30 bg-primary/5">
                   <div className="flex items-center justify-between mb-2 gap-2">
-                    <div className="font-semibold text-sm flex items-center gap-2 min-w-0">
+                    <div className="font-semibold text-sm flex items-start gap-2 min-w-0">
                       <CheckCircle2 className="h-4 w-4 text-primary shrink-0" />
-                      <span className="truncate">{summary.recommendation.choice}</span>
+                      <div className={cn("min-w-0 flex-1", markdownInlineClasses)}>
+                        <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
+                          {normalizeMarkdown(summary.recommendation.choice)}
+                        </ReactMarkdown>
+                      </div>
                     </div>
                     <span
                       className={cn(
@@ -259,16 +289,20 @@ export default function DecisionSummaryPanel({
                     </span>
                   </div>
 
-                  <p className="text-xs text-muted-foreground leading-relaxed mb-2">
-                    {summary.recommendation.reasoning}
-                  </p>
+                  <div className={cn("text-xs mb-2", markdownTextClasses)}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
+                      {normalizeMarkdown(summary.recommendation.reasoning)}
+                    </ReactMarkdown>
+                  </div>
 
                   {summary.recommendation.tradeoffs && (
                     <div className="text-xs mt-2">
-                      <span className="font-medium text-amber-400">Tradeoffs: </span>
-                      <span className="text-muted-foreground">
-                        {summary.recommendation.tradeoffs}
-                      </span>
+                      <div className="font-medium text-amber-400 mb-1">Tradeoffs:</div>
+                      <div className={markdownTextClasses}>
+                        <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
+                          {normalizeMarkdown(summary.recommendation.tradeoffs)}
+                        </ReactMarkdown>
+                      </div>
                     </div>
                   )}
 
@@ -276,11 +310,15 @@ export default function DecisionSummaryPanel({
                     summary.recommendation.next_steps.length > 0 && (
                       <div className="mt-3">
                         <div className="text-xs font-medium mb-1">Next Steps:</div>
-                        <ul className="text-xs text-muted-foreground space-y-1.5">
+                        <ul className="text-xs text-muted-foreground space-y-2">
                           {summary.recommendation.next_steps.map((step, i) => (
                             <li key={i} className="flex items-start gap-2">
                               <span className="mt-0.5 h-3.5 w-3.5 rounded-sm border border-border bg-background/70 shrink-0" />
-                              {step}
+                              <div className={cn("min-w-0 flex-1", markdownTextClasses)}>
+                                <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
+                                  {normalizeMarkdown(step)}
+                                </ReactMarkdown>
+                              </div>
                             </li>
                           ))}
                         </ul>
@@ -292,13 +330,53 @@ export default function DecisionSummaryPanel({
           </>
         )}
 
+        {/* Debate Summary — committee votes and highlights */}
+        {summary?.debate_summary && (
+          <>
+            {summary.debate_summary.final_votes &&
+              Object.keys(summary.debate_summary.final_votes).length > 0 && (
+                <CommitteeVoteTally votes={summary.debate_summary.final_votes} />
+              )}
+
+            {summary.debate_summary.consensus_points &&
+              summary.debate_summary.consensus_points.length > 0 && (
+                <section>
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+                    Committee Consensus
+                  </h3>
+                  <ul className="text-xs text-muted-foreground space-y-1 ml-3">
+                    {summary.debate_summary.consensus_points.map((pt, i) => (
+                      <li key={i} className="list-disc">{pt}</li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+
+            {summary.debate_summary.biases_identified &&
+              summary.debate_summary.biases_identified.length > 0 && (
+                <section>
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+                    Biases Identified
+                  </h3>
+                  <ul className="text-xs text-amber-400/80 space-y-1 ml-3">
+                    {summary.debate_summary.biases_identified.map((b, i) => (
+                      <li key={i} className="list-disc">{b}</li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+          </>
+        )}
+
         {status === "decided" && userChoice && (
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
               Your Decision
             </h3>
             <div className="p-3 rounded-lg border border-green-500/30 bg-green-500/10">
-              <p className="text-sm font-medium text-foreground">{userChoice}</p>
+              <div className="text-sm font-medium text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-0">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{userChoice}</ReactMarkdown>
+              </div>
               {userChoiceReasoning && (
                 <p className="text-xs text-muted-foreground mt-1 whitespace-pre-wrap">
                   {userChoiceReasoning}
@@ -329,6 +407,16 @@ export default function DecisionSummaryPanel({
 
       {shouldShowActions && (
         <div className="border-t border-border p-4 space-y-2 bg-background/95 backdrop-blur-sm">
+          {status === "debating" && (
+            <Button
+              onClick={onCancelDebate}
+              variant="ghost"
+              className="w-full text-destructive hover:text-destructive"
+            >
+              Cancel Debate
+            </Button>
+          )}
+
           {status === "recommended" && (
             <>
               <Button onClick={onAcceptRecommendation} className="w-full">
