@@ -28,7 +28,26 @@ interface SettingsResponse {
   elevenlabs_api_key_set: boolean;
   elevenlabs_api_key_preview: string;
   tts_provider: string;
+  elevenlabs_model: string;
 }
+
+const ELEVENLABS_MODELS = [
+  {
+    id: "eleven_flash_v2_5",
+    label: "Flash v2.5",
+    description: "Fastest latency for live debate.",
+  },
+  {
+    id: "eleven_turbo_v2_5",
+    label: "Turbo v2.5",
+    description: "Balanced quality and speed.",
+  },
+  {
+    id: "eleven_multilingual_v2",
+    label: "Multilingual v2",
+    description: "Higher quality, slower synthesis.",
+  },
+] as const;
 
 export default function Settings({ onClose, onSaved, mustSetKey }: SettingsProps) {
   const [apiKey, setApiKey] = useState("");
@@ -41,6 +60,7 @@ export default function Settings({ onClose, onSaved, mustSetKey }: SettingsProps
   const [elevenlabsPreview, setElevenlabsPreview] = useState("");
   const [hasElevenlabsKey, setHasElevenlabsKey] = useState(false);
   const [ttsProvider, setTtsProvider] = useState("elevenlabs");
+  const [elevenlabsModel, setElevenlabsModel] = useState("eleven_flash_v2_5");
 
   useEffect(() => {
     loadSettings();
@@ -55,6 +75,7 @@ export default function Settings({ onClose, onSaved, mustSetKey }: SettingsProps
       setElevenlabsPreview(settings.elevenlabs_api_key_preview);
       setHasElevenlabsKey(settings.elevenlabs_api_key_set);
       setTtsProvider(settings.tts_provider);
+      setElevenlabsModel(settings.elevenlabs_model || "eleven_flash_v2_5");
     } catch (err) {
       console.error("Failed to load settings:", err);
     }
@@ -75,6 +96,7 @@ export default function Settings({ onClose, onSaved, mustSetKey }: SettingsProps
         model: model.trim(),
         elevenlabsApiKey: elevenlabsApiKey.trim() || null,
         ttsProvider,
+        elevenlabsModel,
       });
       onSaved();
     } catch (err) {
@@ -214,6 +236,29 @@ export default function Settings({ onClose, onSaved, mustSetKey }: SettingsProps
 
           {ttsProvider === "elevenlabs" && (
             <div>
+              <label className="text-sm font-medium text-muted-foreground block mb-1.5">
+                ElevenLabs Model
+              </label>
+              <div className="space-y-2 mb-4">
+                {ELEVENLABS_MODELS.map((modelOption) => (
+                  <button
+                    key={modelOption.id}
+                    type="button"
+                    onClick={() => setElevenlabsModel(modelOption.id)}
+                    className={`w-full text-left py-2 px-3 rounded-md text-xs transition-colors border ${
+                      elevenlabsModel === modelOption.id
+                        ? "bg-accent border-primary ring-1 ring-primary"
+                        : "border-border hover:bg-muted"
+                    }`}
+                  >
+                    <div className="font-medium">{modelOption.label}</div>
+                    <div className="text-muted-foreground mt-0.5">
+                      {modelOption.description}
+                    </div>
+                  </button>
+                ))}
+              </div>
+
               <label className="text-sm font-medium text-muted-foreground block mb-1.5">
                 ElevenLabs API Key
               </label>

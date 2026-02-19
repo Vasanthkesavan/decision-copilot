@@ -562,6 +562,7 @@ export default function DecisionView({
           quickMode={debateQuickMode}
           onBackToChat={() => setDebateActive(false)}
           onDebateComplete={handleDebateComplete}
+          title={title}
         />
       );
     }
@@ -682,6 +683,7 @@ export default function DecisionView({
                     setMobileTab("chat");
                   }}
                   onDebateComplete={handleDebateComplete}
+                  title={title}
                 />
               </div>
             )}

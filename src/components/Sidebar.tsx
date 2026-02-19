@@ -15,6 +15,7 @@ import {
   Star,
   User,
   MessagesSquare,
+  Mic,
   type LucideIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -45,6 +46,8 @@ interface SidebarProps {
   onSelectDecision: (conversationId: string, decisionId: string) => void;
   onNewChat: () => void;
   onNewDecision: () => void;
+  onNewDebate: () => void;
+  onSelectStandaloneDebate: (conversationId: string, decisionId: string) => void;
   onOpenSettings: () => void;
   onOpenProfile: () => void;
   onOpenCommittee: () => void;
@@ -58,12 +61,14 @@ const STATUS_ICONS: Record<
   string,
   { Icon: LucideIcon; color: string; label: string }
 > = {
-  exploring: { Icon: Circle, color: "text-muted-foreground", label: "Exploring" },
+  exploring: { Icon: Circle, color: "text-muted-foreground", label: "Pending" },
   analyzing: { Icon: Disc, color: "text-blue-500", label: "Analyzing" },
   debating: { Icon: MessagesSquare, color: "text-cyan-500", label: "Debating" },
   recommended: { Icon: Diamond, color: "text-amber-500", label: "Recommended" },
   decided: { Icon: Check, color: "text-green-500", label: "Decided" },
   reviewed: { Icon: Star, color: "text-purple-500", label: "Reviewed" },
+  completed: { Icon: Check, color: "text-green-500", label: "Completed" },
+  cancelled: { Icon: Circle, color: "text-muted-foreground", label: "Cancelled" },
 };
 
 export default function Sidebar({
@@ -72,6 +77,8 @@ export default function Sidebar({
   onSelectDecision,
   onNewChat,
   onNewDecision,
+  onNewDebate,
+  onSelectStandaloneDebate,
   onOpenSettings,
   onOpenProfile,
   onOpenCommittee,
@@ -82,10 +89,12 @@ export default function Sidebar({
 }: SidebarProps) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [decisions, setDecisions] = useState<Decision[]>([]);
+  const [standaloneDebates, setStandaloneDebates] = useState<Decision[]>([]);
 
   useEffect(() => {
     loadConversations();
     loadDecisions();
+    loadStandaloneDebates();
   }, [refreshKey]);
 
   async function loadConversations() {
@@ -103,6 +112,15 @@ export default function Sidebar({
       setDecisions(decs);
     } catch (err) {
       console.error("Failed to load decisions:", err);
+    }
+  }
+
+  async function loadStandaloneDebates() {
+    try {
+      const debates = await invoke<Decision[]>("get_standalone_debates");
+      setStandaloneDebates(debates);
+    } catch (err) {
+      console.error("Failed to load standalone debates:", err);
     }
   }
 
@@ -130,6 +148,19 @@ export default function Sidebar({
       loadDecisions();
     } catch (err) {
       console.error("Failed to delete decision:", err);
+    }
+  }
+
+  async function handleDeleteDebate(e: React.MouseEvent, conversationId: string) {
+    e.stopPropagation();
+    try {
+      await invoke("delete_conversation", { conversationId });
+      if (currentConversationId === conversationId) {
+        onNewChat();
+      }
+      loadStandaloneDebates();
+    } catch (err) {
+      console.error("Failed to delete debate:", err);
     }
   }
 
@@ -208,6 +239,66 @@ export default function Sidebar({
                   variant="ghost"
                   size="icon"
                   onClick={(e) => handleDeleteDecision(e, dec.conversation_id)}
+                  className="opacity-0 group-hover:opacity-100 h-7 w-7 text-sidebar-foreground/40 hover:text-sidebar-foreground hover:bg-sidebar-accent shrink-0 ml-2"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            );
+          })}
+        </div>
+
+        <Separator className="bg-sidebar-border mx-3 my-2" />
+
+        {/* Debates Section */}
+        <div className="px-3 pb-1">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-xs font-semibold uppercase tracking-wider text-sidebar-foreground/40">
+              Debates
+            </span>
+          </div>
+          <Button
+            variant="secondary"
+            onClick={onNewDebate}
+            className="w-full justify-start gap-2 mb-1"
+            size="sm"
+          >
+            <Mic className="h-3.5 w-3.5" />
+            New Debate
+          </Button>
+        </div>
+
+        <div className="px-2">
+          {standaloneDebates.map((debate) => {
+            const statusInfo = STATUS_ICONS[debate.status] || STATUS_ICONS.exploring;
+            return (
+              <div
+                key={debate.id}
+                onClick={() => onSelectStandaloneDebate(debate.conversation_id, debate.id)}
+                className={cn(
+                  "group px-3 py-2 rounded-lg cursor-pointer mb-0.5 flex items-center justify-between transition-colors",
+                  currentConversationId === debate.conversation_id
+                    ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                    : "text-sidebar-foreground/60 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground"
+                )}
+              >
+                <div className="min-w-0 flex-1 flex items-center gap-2">
+                  <span title={statusInfo.label} aria-label={statusInfo.label}>
+                    <statusInfo.Icon
+                      className={cn("h-3.5 w-3.5 shrink-0", statusInfo.color)}
+                    />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm truncate">{debate.title}</div>
+                    <div className="text-xs text-sidebar-foreground/30 mt-0.5">
+                      {formatDate(debate.updated_at)}
+                    </div>
+                  </div>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={(e) => handleDeleteDebate(e, debate.conversation_id)}
                   className="opacity-0 group-hover:opacity-100 h-7 w-7 text-sidebar-foreground/40 hover:text-sidebar-foreground hover:bg-sidebar-accent shrink-0 ml-2"
                 >
                   <Trash2 className="h-3.5 w-3.5" />

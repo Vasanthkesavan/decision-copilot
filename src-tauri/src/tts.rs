@@ -43,42 +43,46 @@ struct VoiceConfig {
 /// These are well-known ElevenLabs voice names; the actual IDs are resolved
 /// at generation time if the user hasn't set custom overrides.
 fn default_elevenlabs_voice(agent_key: &str, voice_gender: &str) -> VoiceConfig {
+    // Voice tuning philosophy (from ElevenLabs best practices):
+    // - Lower stability → more expressive, varied intonation (less monotone/robotic)
+    // - Higher style → more dramatic, emotionally responsive delivery
+    // - similarity_boost stays moderate-high so voices remain distinct & clear
     match agent_key {
         "rationalist" => VoiceConfig {
             voice_id: "onwK4e9ZLuTAKqWW03F9".into(), // Daniel
-            stability: 0.7, similarity_boost: 0.8, style: 0.3,
+            stability: 0.45, similarity_boost: 0.78, style: 0.55,
         },
         "advocate" => VoiceConfig {
             voice_id: "21m00Tcm4TlvDq8ikWAM".into(), // Rachel
-            stability: 0.4, similarity_boost: 0.7, style: 0.6,
+            stability: 0.30, similarity_boost: 0.72, style: 0.75,
         },
         "contrarian" => VoiceConfig {
             voice_id: "ErXwobaYiN019PkySvjV".into(), // Antoni
-            stability: 0.3, similarity_boost: 0.7, style: 0.8,
+            stability: 0.25, similarity_boost: 0.70, style: 0.85,
         },
         "visionary" => VoiceConfig {
             voice_id: "EXAVITQu4vr4xnSDxMaL".into(), // Bella
-            stability: 0.6, similarity_boost: 0.8, style: 0.4,
+            stability: 0.35, similarity_boost: 0.75, style: 0.70,
         },
         "pragmatist" => VoiceConfig {
             voice_id: "VR6AewLTigWG4xSOukaG".into(), // Arnold
-            stability: 0.6, similarity_boost: 0.7, style: 0.3,
+            stability: 0.40, similarity_boost: 0.72, style: 0.55,
         },
         "moderator" => VoiceConfig {
             voice_id: "2EiwWnXFnvU5JabPnv8n".into(), // Clyde
-            stability: 0.7, similarity_boost: 0.9, style: 0.5,
+            stability: 0.50, similarity_boost: 0.80, style: 0.60,
         },
-        // Custom agents: pick by gender
+        // Custom agents: pick by gender, balanced expressive settings
         _ => {
             if voice_gender == "female" {
                 VoiceConfig {
                     voice_id: "21m00Tcm4TlvDq8ikWAM".into(), // Rachel
-                    stability: 0.5, similarity_boost: 0.75, style: 0.5,
+                    stability: 0.35, similarity_boost: 0.75, style: 0.65,
                 }
             } else {
                 VoiceConfig {
                     voice_id: "onwK4e9ZLuTAKqWW03F9".into(), // Daniel
-                    stability: 0.5, similarity_boost: 0.75, style: 0.5,
+                    stability: 0.40, similarity_boost: 0.75, style: 0.60,
                 }
             }
         }
@@ -101,11 +105,95 @@ fn default_openai_voice(agent_key: &str, voice_gender: &str) -> &'static str {
     }
 }
 
+// ── TTS text preprocessing ──
+
+/// Prepare normalized debate text for TTS synthesis to sound more natural.
+/// Applies techniques from ElevenLabs best practices:
+/// - Adds short pauses (dashes/ellipses) between major thought transitions
+/// - Inserts <break> tags at sentence boundaries for ElevenLabs
+/// - Ensures emotional punctuation is preserved for prosody cues
+/// - Breaks up overly long sentences for better pacing
+pub fn prepare_text_for_tts(text: &str, provider: &str) -> String {
+    let mut result = text.to_string();
+
+    // 1. Add micro-pauses after transitional/contrast words for natural rhythm.
+    //    A dash creates a short breath pause in most TTS engines.
+    let transitions = [
+        "however ", "but ", "on the other hand ", "that said ",
+        "actually ", "in fact ", "look ", "honestly ",
+        "the thing is ", "here's the point ", "now ",
+    ];
+    for word in &transitions {
+        let capitalized = capitalize_first(word);
+        // Only add dash after sentence-starting transitions (capitalized)
+        let with_pause = format!("{}\u{2014} ", capitalized.trim());
+        result = result.replace(&capitalized, &with_pause);
+    }
+
+    // 2. Add a brief pause before quoted or emphatic phrases.
+    //    Ellipsis before key phrases adds weight (per ElevenLabs docs).
+    let emphatic_starters = [
+        "the real question is",
+        "what matters most is",
+        "the bottom line is",
+        "here's what I think",
+        "the key issue is",
+    ];
+    for phrase in &emphatic_starters {
+        let with_weight = format!("... {}", phrase);
+        result = result.replace(phrase, &with_weight);
+        // Also match capitalized version
+        let cap = capitalize_first(phrase);
+        let cap_with_weight = format!("... {}", cap);
+        result = result.replace(&cap, &cap_with_weight);
+    }
+
+    // 3. For ElevenLabs: insert subtle <break> tags between sentences for breathing room.
+    //    Docs warn not to overuse, so we only add at every 2nd sentence boundary.
+    if provider != "openai" {
+        let mut sentence_count = 0;
+        let mut output = String::with_capacity(result.len() + 200);
+        let mut chars = result.chars().peekable();
+        while let Some(c) = chars.next() {
+            output.push(c);
+            if matches!(c, '.' | '!' | '?') {
+                if let Some(&next) = chars.peek() {
+                    if next == ' ' {
+                        sentence_count += 1;
+                        if sentence_count % 2 == 0 {
+                            output.push_str(" <break time=\"0.3s\" />");
+                        }
+                    }
+                }
+            }
+        }
+        result = output;
+    }
+
+    // 4. Clean up any doubled punctuation or spaces introduced by transformations
+    result = result
+        .replace("... ...", "...")
+        .replace("\u{2014} \u{2014}", "\u{2014}")
+        .replace("  ", " ");
+
+    result.trim().to_string()
+}
+
+/// Capitalize the first character of a string.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
 // ── Audio generation ──
 
 /// Generate audio for a single segment via ElevenLabs API.
 async fn generate_elevenlabs(
     api_key: &str,
+    model_id: &str,
     voice_config: &VoiceConfig,
     text: &str,
     output_path: &Path,
@@ -120,11 +208,12 @@ async fn generate_elevenlabs(
         .header("Content-Type", "application/json")
         .json(&json!({
             "text": text,
-            "model_id": "eleven_multilingual_v2",
+            "model_id": model_id,
             "voice_settings": {
                 "stability": voice_config.stability,
                 "similarity_boost": voice_config.similarity_boost,
                 "style": voice_config.style,
+                "use_speaker_boost": true
             }
         }))
         .send()
@@ -155,7 +244,7 @@ async fn generate_openai(
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&json!({
-            "model": "tts-1",
+            "model": "tts-1-hd",
             "input": text,
             "voice": voice,
             "response_format": "mp3",
@@ -198,6 +287,11 @@ pub async fn generate_segment_audio(
     app_data_dir: &PathBuf,
 ) -> Result<AudioSegment, String> {
     let provider = &config.tts_provider;
+    let elevenlabs_model = if config.elevenlabs_model.trim().is_empty() {
+        "eleven_flash_v2_5"
+    } else {
+        config.elevenlabs_model.trim()
+    };
     let api_key = match provider.as_str() {
         "openai" => {
             if config.openrouter_api_key.is_empty() {
@@ -228,6 +322,9 @@ pub async fn generate_segment_audio(
     let agent_info = registry.iter().find(|a| a.key == round.agent);
     let voice_gender = agent_info.map(|a| a.voice_gender.as_str()).unwrap_or("male");
 
+    // Preprocess text for natural-sounding TTS (pauses, rhythm, emphasis)
+    let tts_text = prepare_text_for_tts(&round.content, provider);
+
     match provider.as_str() {
         "openai" => {
             let voice = if let Some(custom_voice) = config.voices.get(&round.agent) {
@@ -235,14 +332,14 @@ pub async fn generate_segment_audio(
             } else {
                 default_openai_voice(&round.agent, voice_gender)
             };
-            generate_openai(&api_key, voice, &round.content, &output_path).await?;
+            generate_openai(&api_key, voice, &tts_text, &output_path).await?;
         }
         _ => {
             let mut voice_config = default_elevenlabs_voice(&round.agent, voice_gender);
             if let Some(custom_id) = config.voices.get(&round.agent) {
                 voice_config.voice_id = custom_id.clone();
             }
-            generate_elevenlabs(&api_key, &voice_config, &round.content, &output_path).await?;
+            generate_elevenlabs(&api_key, elevenlabs_model, &voice_config, &tts_text, &output_path).await?;
         }
     }
 
@@ -292,6 +389,11 @@ pub async fn generate_debate_audio(
 ) -> Result<AudioManifest, String> {
     // Determine provider and key
     let provider = &config.tts_provider;
+    let elevenlabs_model = if config.elevenlabs_model.trim().is_empty() {
+        "eleven_flash_v2_5"
+    } else {
+        config.elevenlabs_model.trim()
+    };
     let api_key = match provider.as_str() {
         "openai" => {
             if config.openrouter_api_key.is_empty() {
@@ -335,6 +437,9 @@ pub async fn generate_debate_audio(
             "current_agent": round.agent,
         }));
 
+        // Preprocess text for natural-sounding TTS (pauses, rhythm, emphasis)
+        let tts_text = prepare_text_for_tts(&round.content, provider);
+
         // Generate audio via selected provider
         match provider.as_str() {
             "openai" => {
@@ -343,14 +448,14 @@ pub async fn generate_debate_audio(
                 } else {
                     default_openai_voice(&round.agent, voice_gender)
                 };
-                generate_openai(&api_key, voice, &round.content, &output_path).await?;
+                generate_openai(&api_key, voice, &tts_text, &output_path).await?;
             }
             _ => {
                 let mut voice_config = default_elevenlabs_voice(&round.agent, voice_gender);
                 if let Some(custom_id) = config.voices.get(&round.agent) {
                     voice_config.voice_id = custom_id.clone();
                 }
-                generate_elevenlabs(&api_key, &voice_config, &round.content, &output_path).await?;
+                generate_elevenlabs(&api_key, elevenlabs_model, &voice_config, &tts_text, &output_path).await?;
             }
         }
 
@@ -497,5 +602,40 @@ mod tests {
         let bytes: u64 = 160000;
         let expected_ms = (bytes * 1000) / 16000; // 10000ms = 10s
         assert_eq!(expected_ms, 10000);
+    }
+
+    #[test]
+    fn unit_prepare_text_for_tts_adds_pauses_at_transitions_for_elevenlabs() {
+        let input = "However this is risky. But the upside is clear.";
+        let result = prepare_text_for_tts(input, "elevenlabs");
+        assert!(result.contains("\u{2014}"), "should add em-dash after transition words");
+    }
+
+    #[test]
+    fn unit_prepare_text_for_tts_adds_ellipsis_before_emphatic_phrases() {
+        let input = "The real question is whether we can afford it.";
+        let result = prepare_text_for_tts(input, "elevenlabs");
+        assert!(result.contains("... The real question is"), "should add ellipsis before emphatic phrase");
+    }
+
+    #[test]
+    fn unit_prepare_text_for_tts_inserts_break_tags_for_elevenlabs() {
+        let input = "First point. Second point. Third point. Fourth point.";
+        let result = prepare_text_for_tts(input, "elevenlabs");
+        assert!(result.contains("<break time="), "should insert break tags for ElevenLabs");
+    }
+
+    #[test]
+    fn unit_prepare_text_for_tts_no_break_tags_for_openai() {
+        let input = "First point. Second point. Third point. Fourth point.";
+        let result = prepare_text_for_tts(input, "openai");
+        assert!(!result.contains("<break"), "should NOT insert break tags for OpenAI");
+    }
+
+    #[test]
+    fn unit_prepare_text_for_tts_cleans_doubled_punctuation() {
+        let input = "... the real question is whether... the bottom line is clear.";
+        let result = prepare_text_for_tts(input, "openai");
+        assert!(!result.contains("... ..."), "should not produce doubled ellipses");
     }
 }

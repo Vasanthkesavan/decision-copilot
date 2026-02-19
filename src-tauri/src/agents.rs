@@ -399,11 +399,13 @@ pub fn round1_prompt(brief: &str) -> String {
         r#"{brief}
 
 You are in Round 1 of a live committee discussion. Give your opening take as if you're speaking to the other members in real time.
+Treat this as a blind opening: you have NOT heard any other member yet.
 
 Cover these naturally in one response:
 - where you currently lean
 - the single biggest reason for that lean
 - one concern you still have
+- keep it fully independent (do not mirror or reference others)
 
 Style constraints:
 - Natural spoken language
@@ -424,7 +426,7 @@ Here is Round 1 of the committee debate:
 You are in Round 2. React directly to what others actually said.
 
 Rules:
-- Address at least one specific member by name
+- Address at least one specific other member by name (never yourself)
 - Push back on one claim and defend your own view
 - If your view shifted at all, say what moved you
 
@@ -532,7 +534,17 @@ pub fn debate_spoken_style_overlay() -> &'static str {
 - Use direct spoken prose with short natural sentences and contractions.
 - Sound human: vary sentence length and use natural transitions.
 - Reference other members by name naturally when you react to them.
-- Keep it concise and high-signal."#
+- Never refer to yourself by your own speaker label or model name.
+- Keep it concise and high-signal.
+
+Speech rhythm rules (your output will be read aloud by text-to-speech):
+- Vary your sentence length — mix short punchy statements with longer flowing ones.
+- Use rhetorical questions and pauses for emphasis ("And what does that actually get you?").
+- Start some sentences with conversational interjections ("Look,", "Honestly,", "Here's the thing —").
+- Use emotional language the TTS can pick up — express conviction, skepticism, or urgency through word choice.
+- Avoid long compound sentences with multiple clauses. Break them into separate thoughts.
+- Use dashes for dramatic pauses ("This isn't just a career move — it's a lifestyle decision.").
+- End strong. Your last sentence should land with conviction, not trail off."#
 }
 
 /// Template for generating a custom agent's system prompt via LLM.

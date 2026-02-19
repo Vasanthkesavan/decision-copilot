@@ -14,6 +14,11 @@ interface SegmentAudioReadyEvent {
   audio_dir: string;
 }
 
+interface SegmentAudioErrorEvent {
+  decision_id: string;
+  segment_index: number;
+}
+
 export interface LiveAudioSegment {
   index: number;
   agent: string;
@@ -29,6 +34,8 @@ export interface LiveAudioState {
   currentAgent: string | null;
   currentSegment: LiveAudioSegment | null;
   segmentsReady: number;
+  nextSegmentIndex: number;
+  maxReadySegmentIndex: number;
   togglePause: () => void;
   stop: () => void;
 }
@@ -38,6 +45,7 @@ export function useLiveAudioQueue(
   isDebating: boolean
 ): LiveAudioState {
   const readySegments = useRef<Map<number, SegmentAudioReadyEvent>>(new Map());
+  const failedSegments = useRef<Set<number>>(new Set());
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const nextToPlay = useRef(0);
   const isPlayingRef = useRef(false);
@@ -48,8 +56,18 @@ export function useLiveAudioQueue(
   const [currentSegment, setCurrentSegment] = useState<LiveAudioSegment | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [segmentsReady, setSegmentsReady] = useState(0);
+  const [nextSegmentIndex, setNextSegmentIndex] = useState(0);
+  const [maxReadySegmentIndex, setMaxReadySegmentIndex] = useState(-1);
 
-  // Initialize Audio element once
+  const setPlaybackIdle = useCallback((clearCurrent = false) => {
+    isPlayingRef.current = false;
+    setIsPlaying(false);
+    if (clearCurrent) {
+      setCurrentAgent(null);
+      setCurrentSegment(null);
+    }
+  }, []);
+
   useEffect(() => {
     audioRef.current = new Audio();
     return () => {
@@ -61,25 +79,36 @@ export function useLiveAudioQueue(
     };
   }, []);
 
-  // Try to play the next segment in queue
   const tryPlayNext = useCallback(() => {
     if (userPaused.current) return;
 
+    while (failedSegments.current.has(nextToPlay.current)) {
+      nextToPlay.current += 1;
+      setNextSegmentIndex(nextToPlay.current);
+    }
+
     const idx = nextToPlay.current;
     const segment = readySegments.current.get(idx);
-    if (!segment) return; // Not ready yet — will retry when event arrives
+    if (!segment) {
+      setPlaybackIdle(!isDebating);
+      return;
+    }
 
     const audio = audioRef.current;
-    if (!audio) return;
+    if (!audio) {
+      setPlaybackIdle(!isDebating);
+      return;
+    }
 
-    const filePath = `${segment.audio_dir}/${segment.audio_file}`.replace(
-      /\\/g,
-      "/"
-    );
+    const filePath = `${segment.audio_dir}/${segment.audio_file}`.replace(/\\/g, "/");
     const url = convertFileSrc(filePath);
+
     audio.src = url;
     audio.load();
-    audio.play().catch(console.error);
+    audio.play().catch((err) => {
+      console.error(err);
+      setPlaybackIdle(false);
+    });
 
     isPlayingRef.current = true;
     setIsPlaying(true);
@@ -93,62 +122,85 @@ export function useLiveAudioQueue(
       durationMs: segment.duration_ms,
       text: segment.text || "",
     });
-  }, []);
+  }, [isDebating, setPlaybackIdle]);
 
-  // When audio ends, advance to next segment
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
     const handleEnded = () => {
+      setPlaybackIdle(isDebating ? false : true);
       nextToPlay.current += 1;
-      // Small gap between speakers
+      setNextSegmentIndex(nextToPlay.current);
       setTimeout(() => tryPlayNext(), 500);
     };
 
-    audio.addEventListener("ended", handleEnded);
-    return () => audio.removeEventListener("ended", handleEnded);
-  }, [tryPlayNext]);
+    const handleError = () => {
+      setPlaybackIdle(isDebating ? false : true);
+      nextToPlay.current += 1;
+      setNextSegmentIndex(nextToPlay.current);
+      setTimeout(() => tryPlayNext(), 300);
+    };
 
-  // Listen for segment-ready events
+    audio.addEventListener("ended", handleEnded);
+    audio.addEventListener("error", handleError);
+    return () => {
+      audio.removeEventListener("ended", handleEnded);
+      audio.removeEventListener("error", handleError);
+    };
+  }, [isDebating, setPlaybackIdle, tryPlayNext]);
+
   useEffect(() => {
-    const unlisten = listen<SegmentAudioReadyEvent>(
+    const unlistenReady = listen<SegmentAudioReadyEvent>(
       "debate-segment-audio-ready",
       (event) => {
         if (event.payload.decision_id !== decisionId) return;
 
-        readySegments.current.set(
-          event.payload.segment_index,
-          event.payload
-        );
+        readySegments.current.set(event.payload.segment_index, event.payload);
         setSegmentsReady(readySegments.current.size);
+        setMaxReadySegmentIndex((prev) =>
+          Math.max(prev, event.payload.segment_index)
+        );
 
-        // If this is the segment we're waiting to play, start playing
         if (event.payload.segment_index === nextToPlay.current) {
           tryPlayNext();
         }
       }
     );
 
+    const unlistenError = listen<SegmentAudioErrorEvent>(
+      "debate-segment-audio-error",
+      (event) => {
+        if (event.payload.decision_id !== decisionId) return;
+
+        failedSegments.current.add(event.payload.segment_index);
+        if (event.payload.segment_index === nextToPlay.current) {
+          nextToPlay.current += 1;
+          setNextSegmentIndex(nextToPlay.current);
+          tryPlayNext();
+        }
+      }
+    );
+
     return () => {
-      unlisten.then((fn) => fn());
+      unlistenReady.then((fn) => fn());
+      unlistenError.then((fn) => fn());
     };
   }, [decisionId, tryPlayNext]);
 
-  // Reset when a new debate starts
   useEffect(() => {
     if (isDebating) {
       readySegments.current.clear();
+      failedSegments.current.clear();
       nextToPlay.current = 0;
       userPaused.current = false;
-      isPlayingRef.current = false;
-      setIsPlaying(false);
+      setPlaybackIdle(true);
       setCurrentSegmentIndex(-1);
-      setCurrentAgent(null);
-      setCurrentSegment(null);
       setSegmentsReady(0);
+      setNextSegmentIndex(0);
+      setMaxReadySegmentIndex(-1);
     }
-  }, [isDebating]);
+  }, [isDebating, setPlaybackIdle]);
 
   const togglePause = useCallback(() => {
     const audio = audioRef.current;
@@ -156,9 +208,8 @@ export function useLiveAudioQueue(
 
     if (isPlayingRef.current) {
       audio.pause();
-      isPlayingRef.current = false;
       userPaused.current = true;
-      setIsPlaying(false);
+      setPlaybackIdle(false);
     } else {
       userPaused.current = false;
       if (audio.src) {
@@ -166,7 +217,6 @@ export function useLiveAudioQueue(
         isPlayingRef.current = true;
         setIsPlaying(true);
       } else {
-        // No current source — try to play the next queued segment
         tryPlayNext();
       }
     }
@@ -178,12 +228,9 @@ export function useLiveAudioQueue(
       audio.pause();
       audio.src = "";
     }
-    isPlayingRef.current = false;
     userPaused.current = true;
-    setIsPlaying(false);
-    setCurrentAgent(null);
-    setCurrentSegment(null);
-  }, []);
+    setPlaybackIdle(true);
+  }, [setPlaybackIdle]);
 
   return {
     isPlaying,
@@ -191,6 +238,8 @@ export function useLiveAudioQueue(
     currentAgent,
     currentSegment,
     segmentsReady,
+    nextSegmentIndex,
+    maxReadySegmentIndex,
     togglePause,
     stop,
   };

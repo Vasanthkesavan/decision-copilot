@@ -18,7 +18,9 @@
     "test:backend": "cargo test --manifest-path src-tauri/Cargo.toml",
     "test:backend:unit": "cargo test --manifest-path src-tauri/Cargo.toml unit_",
     "test:backend:integration": "cargo test --manifest-path src-tauri/Cargo.toml integration_",
-    "test:backend:e2e": "cargo test --manifest-path src-tauri/Cargo.toml e2e_"
+    "test:backend:e2e": "cargo test --manifest-path src-tauri/Cargo.toml e2e_",
+    "remotion:preview": "remotion preview src/remotion/index.ts",
+    "remotion:render": "remotion render src/remotion/index.ts DebateVideo"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",
@@ -27,17 +29,21 @@
     "@radix-ui/react-separator": "^1.1.8",
     "@radix-ui/react-slot": "^1.2.4",
     "@radix-ui/react-tooltip": "^1.2.8",
+    "@remotion/cli": "^4.0.424",
+    "@remotion/player": "^4.0.424",
     "@tailwindcss/vite": "^4.1.18",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "jspdf": "^4.1.0",
     "lucide-react": "^0.564.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
+    "remotion": "^4.0.424",
     "tailwind-merge": "^3.4.1",
     "tailwindcss": "^4.1.18"
   },

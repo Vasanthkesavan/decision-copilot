@@ -5,11 +5,24 @@ use crate::decisions;
 use crate::llm;
 use crate::profile;
 use crate::tts;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
+
+const STANDALONE_MODE_FIXED: &str = "fixed";
+const STANDALONE_MODE_MODERATOR_AUTO: &str = "moderator_auto";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StandaloneDebateConfig {
+    pub mode: String,
+    #[serde(default, alias = "exchangeCount")]
+    pub exchange_count: Option<u32>,
+    #[serde(default, alias = "maxExchanges")]
+    pub max_exchanges: Option<u32>,
+}
 
 /// Normalize model output so spoken debate feels conversational in UI + TTS.
 fn normalize_spoken_debate_output(text: &str) -> String {
@@ -258,6 +271,179 @@ fn compile_brief(
     Ok(brief)
 }
 
+fn standalone_debater_system_prompt(agent_label: &str) -> String {
+    format!(
+        r#"You are {} in a standalone sandbox debate about a user-provided topic.
+
+This debate is NOT about any user profile or personal decision context.
+Only use the topic and arguments in the transcript.
+
+Identity rules:
+- Speak in first person ("I", "my view")
+- Never refer to yourself by your speaker name or model id
+
+Role guidance:
+- Make concrete claims and defend them with reasoning
+- Directly respond to other speakers when they make weak assumptions
+- Concede strong counterpoints when appropriate
+- Stay concise, clear, and debate-focused"#,
+        agent_label
+    )
+}
+
+fn normalize_standalone_config(
+    config: Option<StandaloneDebateConfig>,
+    quick_mode: bool,
+) -> StandaloneDebateConfig {
+    match config {
+        Some(mut cfg) => {
+            let mode = cfg.mode.trim().to_lowercase();
+            if mode == STANDALONE_MODE_MODERATOR_AUTO {
+                cfg.mode = STANDALONE_MODE_MODERATOR_AUTO.to_string();
+                let max_exchanges = cfg.max_exchanges.unwrap_or(12).clamp(2, 20);
+                cfg.max_exchanges = Some(max_exchanges);
+                cfg.exchange_count = None;
+                cfg
+            } else {
+                cfg.mode = STANDALONE_MODE_FIXED.to_string();
+                let default_exchanges = if quick_mode { 0 } else { 2 };
+                let exchanges = cfg.exchange_count.unwrap_or(default_exchanges).clamp(0, 12);
+                cfg.exchange_count = Some(exchanges);
+                cfg.max_exchanges = None;
+                cfg
+            }
+        }
+        None => {
+            let exchanges = if quick_mode { 0 } else { 2 };
+            StandaloneDebateConfig {
+                mode: STANDALONE_MODE_FIXED.to_string(),
+                exchange_count: Some(exchanges),
+                max_exchanges: None,
+            }
+        }
+    }
+}
+
+fn standalone_moderator_system_prompt() -> &'static str {
+    r#"You are the moderator of a standalone sandbox debate.
+
+Your job is to synthesize arguments across models into a practical takeaway.
+Do not reference user profile data or personal decision context.
+
+Keep the final verdict short and decisive:
+- Maximum 130 words total
+- 2 concise sections only (Verdict, Next Steps)
+- At most 2 next steps"#
+}
+
+fn standalone_moderator_prompt(brief: &str, transcript: &str, participants: &str) -> String {
+    format!(
+        r#"{brief}
+
+The following models participated: {participants}
+
+Here is the full debate transcript:
+
+{transcript}
+
+Return a concise synthesis using exactly this format:
+
+## Verdict
+[2-3 sentences, direct conclusion]
+
+## Next Steps
+- [Action 1]
+- [Action 2]"#
+    )
+}
+
+fn standalone_moderator_steering_system_prompt() -> &'static str {
+    r#"You are a debate moderator guiding a live multi-model discussion.
+
+Return ONLY strict JSON with this schema:
+{"conclude": boolean, "direction": string}
+
+Rules:
+- direction must be 8-28 words
+- no markdown, no bullets
+- conclude=true only when discussion is repeating or core disagreement is resolved
+- if conclude=true, direction should briefly justify ending the debate"#
+}
+
+fn standalone_moderator_steering_prompt(
+    brief: &str,
+    transcript: &str,
+    participants: &str,
+    exchange_number: i32,
+) -> String {
+    format!(
+        r#"{brief}
+
+Participants: {participants}
+Current exchange completed: {exchange_number}
+
+Transcript so far:
+{transcript}
+
+Decide whether to continue debate exchanges or conclude now.
+Return JSON only."#
+    )
+}
+
+fn parse_json_object(raw: &str) -> Option<Value> {
+    if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
+        return Some(v);
+    }
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<Value>(&raw[start..=end]).ok()
+}
+
+async fn request_moderator_direction(
+    api_key: &str,
+    moderator_model: &str,
+    brief: &str,
+    transcript: &str,
+    participants: &str,
+    exchange_number: i32,
+) -> Result<(String, bool), String> {
+    let raw = llm::call_llm_simple(
+        api_key,
+        moderator_model,
+        standalone_moderator_steering_system_prompt(),
+        &standalone_moderator_steering_prompt(brief, transcript, participants, exchange_number),
+    )
+    .await?;
+
+    let parsed = parse_json_object(&raw);
+    let conclude = parsed
+        .as_ref()
+        .and_then(|v| v.get("conclude"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut direction = parsed
+        .as_ref()
+        .and_then(|v| v.get("direction"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+
+    if direction.is_empty() {
+        direction = "Focus on the core unresolved disagreement and challenge each other's strongest assumptions directly.".to_string();
+    }
+    if direction.len() > 220 {
+        direction.truncate(220);
+        direction = direction.trim().trim_end_matches(',').to_string();
+    }
+
+    Ok((direction, conclude))
+}
+
 /// Format the debate transcript so far for injection into prompts.
 fn format_transcript(rounds: &[crate::db::DebateRound], all_agents: &[AgentInfo]) -> String {
     let mut sections: Vec<String> = Vec::new();
@@ -343,6 +529,8 @@ async fn run_sequential_round(
     debaters: &[AgentInfo],
     all_agents: &[AgentInfo],
     tts_state: &LiveTtsState,
+    standalone_sandbox: bool,
+    round_direction: Option<&str>,
 ) -> Result<Vec<crate::db::DebateRound>, String> {
     if cancel_flag.load(Ordering::Relaxed) {
         return Err("Debate cancelled".to_string());
@@ -384,9 +572,44 @@ async fn run_sequential_round(
                     prior_speaker
                 ));
             }
+            if let Some(direction) = round_direction {
+                let direction = direction.trim();
+                if !direction.is_empty() {
+                    user_prompt.push_str(&format!(
+                        "\n\nModerator guidance for this exchange (follow naturally, do not quote it verbatim, and do not mention the moderator): {}",
+                        direction
+                    ));
+                }
+            }
+        }
+        if round_number == 1 {
+            user_prompt.push_str(&format!(
+                "\n\nRound 1 constraints:\n- You are speaking as \"{}\".\n- This is a blind opening; no other opening statements are available to you.\n- Do not reference, quote, or align with any other speaker yet.\n- State your independent initial position in first person.",
+                agent.label
+            ));
+        } else {
+            let other_speaker_labels = debaters
+                .iter()
+                .filter(|d| d.key != agent.key)
+                .map(|d| d.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let other_speaker_labels = if other_speaker_labels.is_empty() {
+                "none".to_string()
+            } else {
+                other_speaker_labels
+            };
+            user_prompt.push_str(&format!(
+                "\n\nIdentity constraints:\n- You are speaking as \"{}\".\n- Never address yourself by name.\n- Never refer to yourself using your model id.\n- If referencing your own earlier point, use first person (\"I\", \"my view\") instead of your name.\n- Only mention speakers from this list: {}.\n- Do not invent or mention speakers not in that list.",
+                agent.label, other_speaker_labels
+            ));
         }
 
-        let base_system_prompt = agents::read_agent_prompt(app_data_dir, &agent.key);
+        let base_system_prompt = if standalone_sandbox {
+            standalone_debater_system_prompt(&agent.label)
+        } else {
+            agents::read_agent_prompt(app_data_dir, &agent.key)
+        };
         let system_prompt = format!(
             "{}\n\n{}",
             base_system_prompt,
@@ -459,9 +682,16 @@ pub async fn run_debate(
     quick_mode: bool,
     cancel_flag: Arc<AtomicBool>,
     selected_agent_keys: Option<Vec<String>>,
+    brief_override: Option<String>,
+    standalone_participants: Option<Vec<AgentInfo>>,
+    standalone_model_map: Option<HashMap<String, String>>,
+    standalone_config: Option<StandaloneDebateConfig>,
 ) -> Result<(), String> {
-    // 1. Compile brief
-    let brief = compile_brief(&app_handle, &decision_id)?;
+    // 1. Compile brief (or use override for standalone debates)
+    let brief = match brief_override {
+        Some(b) => b,
+        None => compile_brief(&app_handle, &decision_id)?,
+    };
 
     // 2. Save brief and update status
     {
@@ -475,19 +705,31 @@ pub async fn run_debate(
     // 3. Emit debate-started
     let _ = app_handle.emit("debate-started", json!({ "decision_id": decision_id }));
 
+    let standalone_sandbox = standalone_participants.is_some();
+
     // Load LLM config and app_data_dir
-    let (api_key, model, agent_models, app_data_dir) = {
+    let (api_key, model, mut agent_models, app_data_dir) = {
         let state: tauri::State<'_, Mutex<AppState>> = app_handle.state();
         let state_guard = state.lock().map_err(|e| e.to_string())?;
         let config = config::load_config(&state_guard.app_data_dir);
         (config.openrouter_api_key, config.model, config.agent_models, state_guard.app_data_dir.clone())
     };
 
-    // Ensure agent prompt files exist
-    agents::init_agent_files(&app_data_dir).ok();
+    if let Some(model_overrides) = standalone_model_map {
+        for (agent_key, model_id) in model_overrides {
+            if !model_id.trim().is_empty() {
+                agent_models.insert(agent_key, model_id);
+            }
+        }
+    }
+
+    // Ensure agent prompt files exist (committee flow only)
+    if !standalone_sandbox {
+        agents::init_agent_files(&app_data_dir).ok();
+    }
 
     // Load agent registry and determine participants
-    let registry = agents::load_registry(&app_data_dir);
+    let registry = standalone_participants.unwrap_or_else(|| agents::load_registry(&app_data_dir));
     let all_debaters_in_registry: Vec<AgentInfo> = registry.iter()
         .filter(|a| a.role == "debater")
         .cloned()
@@ -536,38 +778,135 @@ pub async fn run_debate(
         &api_key, &model, &agent_models,
         &brief, &all_rounds, 1, 1,
         &app_handle, &decision_id, &cancel_flag, &app_data_dir,
-        &debaters, &all_agents, &tts_state,
+        &debaters, &all_agents, &tts_state, standalone_sandbox, None,
     ).await?;
     all_rounds.extend(round1);
 
-    if quick_mode {
-        // Quick mode: skip Round 2 & 3, go straight to moderator
+    let mut include_final_positions = !quick_mode;
+
+    if standalone_sandbox {
+        let cfg = normalize_standalone_config(standalone_config, quick_mode);
+        if cfg.mode == STANDALONE_MODE_MODERATOR_AUTO {
+            include_final_positions = false;
+            let max_exchanges = cfg.max_exchanges.unwrap_or(12) as i32;
+            let participant_names_for_steering = agents::format_participant_names(&debaters);
+            let moderator_model = agent_models
+                .get("moderator")
+                .filter(|m| !m.is_empty())
+                .map(|m| m.as_str())
+                .unwrap_or(&model);
+            let mut direction_for_next_exchange: Option<String> = None;
+
+            for exchange in 1..=max_exchanges {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return handle_cancellation(&app_handle, &decision_id);
+                }
+
+                let exchange_rounds = run_sequential_round(
+                    &api_key, &model, &agent_models,
+                    &brief, &all_rounds, 2, exchange,
+                    &app_handle, &decision_id, &cancel_flag, &app_data_dir,
+                    &debaters, &all_agents, &tts_state, standalone_sandbox,
+                    direction_for_next_exchange.as_deref(),
+                ).await?;
+                all_rounds.extend(exchange_rounds);
+
+                let transcript = format_transcript(&all_rounds, &all_agents);
+                let (direction, conclude) = request_moderator_direction(
+                    &api_key,
+                    moderator_model,
+                    &brief,
+                    &transcript,
+                    &participant_names_for_steering,
+                    exchange,
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    (
+                        "Focus on the strongest unresolved disagreement and pressure-test the most important assumption.".to_string(),
+                        false,
+                    )
+                });
+
+                if conclude {
+                    break;
+                }
+                direction_for_next_exchange = Some(direction);
+            }
+        } else {
+            let exchanges = cfg.exchange_count.unwrap_or(2) as i32;
+            include_final_positions = exchanges > 0;
+            let participant_names_for_steering = agents::format_participant_names(&debaters);
+            let moderator_model = agent_models
+                .get("moderator")
+                .filter(|m| !m.is_empty())
+                .map(|m| m.as_str())
+                .unwrap_or(&model);
+            let mut direction_for_next_exchange: Option<String> = None;
+
+            for exchange in 1..=exchanges {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return handle_cancellation(&app_handle, &decision_id);
+                }
+                let exchange_rounds = run_sequential_round(
+                    &api_key, &model, &agent_models,
+                    &brief, &all_rounds, 2, exchange,
+                    &app_handle, &decision_id, &cancel_flag, &app_data_dir,
+                    &debaters, &all_agents, &tts_state, standalone_sandbox,
+                    direction_for_next_exchange.as_deref(),
+                ).await?;
+                all_rounds.extend(exchange_rounds);
+
+                if exchange < exchanges {
+                    let transcript = format_transcript(&all_rounds, &all_agents);
+                    let (direction, _) = request_moderator_direction(
+                        &api_key,
+                        moderator_model,
+                        &brief,
+                        &transcript,
+                        &participant_names_for_steering,
+                        exchange,
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        (
+                            "Challenge the strongest assumption from the previous exchange and tighten the evidence behind each claim.".to_string(),
+                            false,
+                        )
+                    });
+                    direction_for_next_exchange = Some(direction);
+                }
+            }
+        }
     } else {
-        // 5. Round 2 Exchange 1
-        if cancel_flag.load(Ordering::Relaxed) {
-            return handle_cancellation(&app_handle, &decision_id);
-        }
-        let r2e1 = run_sequential_round(
-            &api_key, &model, &agent_models,
-            &brief, &all_rounds, 2, 1,
-            &app_handle, &decision_id, &cancel_flag, &app_data_dir,
-            &debaters, &all_agents, &tts_state,
-        ).await?;
-        all_rounds.extend(r2e1);
+        if !quick_mode {
+            // 5. Round 2 Exchange 1
+            if cancel_flag.load(Ordering::Relaxed) {
+                return handle_cancellation(&app_handle, &decision_id);
+            }
+            let r2e1 = run_sequential_round(
+                &api_key, &model, &agent_models,
+                &brief, &all_rounds, 2, 1,
+                &app_handle, &decision_id, &cancel_flag, &app_data_dir,
+                &debaters, &all_agents, &tts_state, standalone_sandbox, None,
+            ).await?;
+            all_rounds.extend(r2e1);
 
-        // 6. Round 2 Exchange 2
-        if cancel_flag.load(Ordering::Relaxed) {
-            return handle_cancellation(&app_handle, &decision_id);
+            // 6. Round 2 Exchange 2
+            if cancel_flag.load(Ordering::Relaxed) {
+                return handle_cancellation(&app_handle, &decision_id);
+            }
+            let r2e2 = run_sequential_round(
+                &api_key, &model, &agent_models,
+                &brief, &all_rounds, 2, 2,
+                &app_handle, &decision_id, &cancel_flag, &app_data_dir,
+                &debaters, &all_agents, &tts_state, standalone_sandbox, None,
+            ).await?;
+            all_rounds.extend(r2e2);
         }
-        let r2e2 = run_sequential_round(
-            &api_key, &model, &agent_models,
-            &brief, &all_rounds, 2, 2,
-            &app_handle, &decision_id, &cancel_flag, &app_data_dir,
-            &debaters, &all_agents, &tts_state,
-        ).await?;
-        all_rounds.extend(r2e2);
+    }
 
-        // 7. Round 3: Final Positions
+    if include_final_positions {
         if cancel_flag.load(Ordering::Relaxed) {
             return handle_cancellation(&app_handle, &decision_id);
         }
@@ -575,7 +914,7 @@ pub async fn run_debate(
             &api_key, &model, &agent_models,
             &brief, &all_rounds, 3, 1,
             &app_handle, &decision_id, &cancel_flag, &app_data_dir,
-            &debaters, &all_agents, &tts_state,
+            &debaters, &all_agents, &tts_state, standalone_sandbox, None,
         ).await?;
         all_rounds.extend(round3);
     }
@@ -586,8 +925,16 @@ pub async fn run_debate(
     }
 
     let transcript = format_transcript(&all_rounds, &all_agents);
-    let moderator_user_prompt = agents::moderator_prompt(&brief, &transcript, &participant_names);
-    let moderator_system_prompt = agents::read_agent_prompt(&app_data_dir, "moderator");
+    let moderator_user_prompt = if standalone_sandbox {
+        standalone_moderator_prompt(&brief, &transcript, &participant_names)
+    } else {
+        agents::moderator_prompt(&brief, &transcript, &participant_names)
+    };
+    let moderator_system_prompt = if standalone_sandbox {
+        standalone_moderator_system_prompt().to_string()
+    } else {
+        agents::read_agent_prompt(&app_data_dir, "moderator")
+    };
 
     let moderator_model = agent_models.get("moderator").filter(|m| !m.is_empty()).map(|m| m.as_str()).unwrap_or(&model);
     let moderator_response = call_agent_with_retry(
@@ -627,15 +974,31 @@ pub async fn run_debate(
         spawn_segment_tts(&tts_state, &app_handle, &decision_id, &moderator_round);
     }
 
-    // 9. Parse moderator output and update decision summary
-    update_summary_from_debate(&app_handle, &decision_id, &all_rounds, &moderator_response, &debaters)?;
+    // Determine if this is a standalone debate (conversation type="debate")
+    let is_standalone = {
+        let state: tauri::State<'_, Mutex<AppState>> = app_handle.state();
+        let sg = state.lock().map_err(|e| e.to_string())?;
+        let decision = sg.db.get_decision(&decision_id).map_err(|e| e.to_string())?;
+        if let Some(d) = decision {
+            let conv = sg.db.get_conversation(&d.conversation_id).map_err(|e| e.to_string())?;
+            conv.map(|c| c.conv_type == "debate").unwrap_or(false)
+        } else {
+            false
+        }
+    };
+
+    // 9. Parse moderator output and update decision summary (skip for standalone debates)
+    if !is_standalone {
+        update_summary_from_debate(&app_handle, &decision_id, &all_rounds, &moderator_response, &debaters)?;
+    }
 
     // 10. Mark debate complete
     {
         let state: tauri::State<'_, Mutex<AppState>> = app_handle.state();
         let state_guard = state.lock().map_err(|e| e.to_string())?;
         state_guard.db.update_debate_completed(&decision_id).map_err(|e| e.to_string())?;
-        state_guard.db.update_decision_status(&decision_id, "recommended").map_err(|e| e.to_string())?;
+        let terminal_status = if is_standalone { "completed" } else { "recommended" };
+        state_guard.db.update_decision_status(&decision_id, terminal_status).map_err(|e| e.to_string())?;
     }
 
     let _ = app_handle.emit("debate-complete", json!({ "decision_id": decision_id }));
@@ -688,7 +1051,21 @@ pub async fn run_debate(
 fn handle_cancellation(app_handle: &tauri::AppHandle, decision_id: &str) -> Result<(), String> {
     let state: tauri::State<'_, Mutex<AppState>> = app_handle.state();
     let state_guard = state.lock().map_err(|e| e.to_string())?;
-    state_guard.db.update_decision_status(decision_id, "analyzing").map_err(|e| e.to_string())?;
+    // Determine cancel status based on conversation type
+    let cancel_status = {
+        let decision = state_guard.db.get_decision(decision_id).map_err(|e| e.to_string())?;
+        if let Some(d) = decision {
+            let conv = state_guard.db.get_conversation(&d.conversation_id).map_err(|e| e.to_string())?;
+            if conv.map(|c| c.conv_type == "debate").unwrap_or(false) {
+                "cancelled"
+            } else {
+                "analyzing"
+            }
+        } else {
+            "analyzing"
+        }
+    };
+    state_guard.db.update_decision_status(decision_id, cancel_status).map_err(|e| e.to_string())?;
     let _ = app_handle.emit("debate-error", json!({
         "decision_id": decision_id,
         "error": "Debate cancelled",
@@ -934,4 +1311,3 @@ Third
         assert!(cleaned.contains("Burnout risk is still real."));
     }
 }
-

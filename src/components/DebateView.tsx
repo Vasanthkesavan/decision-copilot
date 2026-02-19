@@ -2,7 +2,9 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { appDataDir } from "@tauri-apps/api/path";
-import { ArrowLeft, XCircle, Volume2, Pause, Play, X, Mic } from "lucide-react";
+import { ArrowLeft, XCircle, Volume2, Pause, Play, X, Mic, Video, FileText } from "lucide-react";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { generateDebatePdf } from "@/lib/generateDebatePdf";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import DebateAgentMessage from "./DebateAgentMessage";
@@ -12,9 +14,11 @@ import ModeratorVerdict from "./ModeratorVerdict";
 import AudioPlayer from "./AudioPlayer";
 import AudioGenerationProgress from "./AudioGenerationProgress";
 import AudioWaveform from "./AudioWaveform";
+import VideoExportDialog from "./VideoExportDialog";
 import { useLiveAudioQueue } from "@/hooks/useLiveAudioQueue";
 import type { AgentMeta } from "@/lib/agentColors";
 import { resolveAgentConfig } from "@/lib/agentColors";
+import type { StandaloneDebateConfig } from "./DebateModelSelectionDialog";
 
 interface AudioSegment {
   index: number;
@@ -94,14 +98,28 @@ interface RoundCompleteEvent {
   exchange_number: number;
 }
 
+interface DecisionRecord {
+  summary_json: string | null;
+}
+
+interface StandaloneSandboxSummary {
+  standalone_sandbox?: {
+    participants?: AgentMeta[];
+    model_map?: Record<string, string>;
+  };
+}
+
 const SYNC_TRANSCRIPT_WITH_LIVE_AUDIO = true;
 
 interface DebateViewProps {
   decisionId: string;
   isDebating: boolean;
   quickMode: boolean;
+  debateConfig?: StandaloneDebateConfig;
   onBackToChat: () => void;
   onDebateComplete: () => void;
+  backButtonLabel?: string;
+  title?: string;
 }
 
 // Group rounds by (round_number, exchange_number)
@@ -134,15 +152,46 @@ function groupRounds(rounds: DebateRoundData[]): RoundGroup[] {
   return groups;
 }
 
+function appendUniqueRound(
+  prev: DebateRoundData[],
+  next: DebateRoundData
+): DebateRoundData[] {
+  const exists = prev.some(
+    (r) =>
+      r.round_number === next.round_number &&
+      r.exchange_number === next.exchange_number &&
+      r.agent === next.agent &&
+      r.content.trim() === next.content.trim()
+  );
+  if (exists) return prev;
+  return [...prev, next];
+}
+
+function shortModelLabel(modelId: string): string {
+  const trimmed = modelId.trim();
+  const slashIdx = trimmed.indexOf("/");
+  const base = slashIdx >= 0 ? trimmed.slice(slashIdx + 1) : trimmed;
+  const withoutFree = base.endsWith(":free")
+    ? base.slice(0, Math.max(0, base.length - ":free".length))
+    : base;
+  return withoutFree.length <= 30
+    ? withoutFree
+    : `${withoutFree.slice(0, 27)}...`;
+}
+
 export default function DebateView({
   decisionId,
   isDebating,
   quickMode,
+  debateConfig,
   onBackToChat,
   onDebateComplete,
+  backButtonLabel,
+  title: debateTitle,
 }: DebateViewProps) {
   const [rounds, setRounds] = useState<DebateRoundData[]>([]);
   const [currentRound, setCurrentRound] = useState(1);
+  const [currentExchange, setCurrentExchange] = useState(1);
   const [collapsedRounds, setCollapsedRounds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [debateRunning, setDebateRunning] = useState(isDebating);
@@ -157,12 +206,15 @@ export default function DebateView({
   const liveAudioPlayingRef = useRef(false);
   const lastRevealedSegmentRef = useRef(-1);
   const sawLiveAudioRef = useRef(false);
+  const [hasLiveAudio, setHasLiveAudio] = useState(false);
   const [registry, setRegistry] = useState<AgentMeta[]>([]);
 
   // Audio playback state
   const [audioManifest, setAudioManifest] = useState<AudioManifest | null>(null);
   const [audioDir, setAudioDir] = useState<string>("");
   const [showPlayer, setShowPlayer] = useState(false);
+  const [showVideoExport, setShowVideoExport] = useState(false);
+  const [pdfExporting, setPdfExporting] = useState(false);
   const [audioGenerating, setAudioGenerating] = useState(false);
   const [audioProgress, setAudioProgress] = useState({ completed: 0, total: 0, currentAgent: "" });
 
@@ -170,7 +222,32 @@ export default function DebateView({
   const liveAudio = useLiveAudioQueue(decisionId, debateRunning);
 
   // Total rounds: quick mode = 2 (round 1 + moderator), full = 5 (r1, r2e1, r2e2, r3, moderator)
-  const totalRounds = quickMode ? 2 : 5;
+  const fixedExchangeCount =
+    debateConfig?.mode === "fixed"
+      ? Math.max(0, Math.min(12, debateConfig.exchangeCount ?? (quickMode ? 0 : 2)))
+      : null;
+  const moderatorDirected = debateConfig?.mode === "moderator_auto";
+  const totalRounds =
+    fixedExchangeCount !== null
+      ? fixedExchangeCount === 0
+        ? 2
+        : fixedExchangeCount + 3
+      : quickMode
+      ? 2
+      : 5;
+  const modeLabel = moderatorDirected
+    ? "Moderator Directed"
+    : fixedExchangeCount === 0
+    ? "Quick Take"
+    : quickMode
+    ? "Quick Take"
+    : "Full Debate";
+
+  useEffect(() => {
+    if (isDebating) {
+      setDebateRunning(true);
+    }
+  }, [isDebating]);
 
   useEffect(() => {
     liveAudioPlayingRef.current = liveAudio.isPlaying;
@@ -188,13 +265,48 @@ export default function DebateView({
     }
     lastRevealedSegmentRef.current = -1;
     sawLiveAudioRef.current = false;
+    setCurrentRound(1);
+    setCurrentExchange(1);
+    setHasLiveAudio(false);
     pendingResponsesRef.current = {};
     setPendingResponses({});
     setStreamingMessages({});
     loadDebate();
-    invoke<AgentMeta[]>("get_agent_registry").then(setRegistry).catch(console.error);
+    loadDebateRegistry();
     loadExistingAudio();
   }, [decisionId]);
+
+  async function loadDebateRegistry() {
+    try {
+      const decision = await invoke<DecisionRecord>("get_decision", { decisionId });
+      if (decision.summary_json) {
+        const parsed: StandaloneSandboxSummary = JSON.parse(decision.summary_json);
+        const participants = parsed.standalone_sandbox?.participants;
+        const modelMap = parsed.standalone_sandbox?.model_map || {};
+        if (participants && participants.length > 0) {
+          const normalized = participants.map((participant) => {
+            const modelIdFromLabel =
+              participant.label.match(/\(([^)]+\/[^)]+)\)/)?.[1] || null;
+            const modelId = modelMap[participant.key] || modelIdFromLabel || undefined;
+            if (participant.role === "debater" && modelId) {
+              return {
+                ...participant,
+                label: shortModelLabel(modelId),
+                emoji: "\u{1f916}",
+              };
+            }
+            return participant;
+          });
+          setRegistry(normalized);
+          return;
+        }
+      }
+    } catch {
+      // Ignore and fall back to committee registry.
+    }
+
+    invoke<AgentMeta[]>("get_agent_registry").then(setRegistry).catch(console.error);
+  }
 
   async function loadExistingAudio() {
     try {
@@ -220,6 +332,7 @@ export default function DebateView({
       "debate-agent-token",
       (event) => {
         if (event.payload.decision_id !== decisionId) return;
+        setDebateRunning(true);
         const { round_number, exchange_number, agent, token } = event.payload;
 
         if (!SYNC_TRANSCRIPT_WITH_LIVE_AUDIO) {
@@ -238,11 +351,14 @@ export default function DebateView({
           });
         }
 
-        // Track current round for progress
-        if (round_number !== 99) {
-          setCurrentRound(round_number);
-        } else {
-          setCurrentRound(99);
+        if (!SYNC_TRANSCRIPT_WITH_LIVE_AUDIO || !hasLiveAudio) {
+          if (round_number !== 99) {
+            setCurrentRound(round_number);
+            setCurrentExchange(exchange_number || 1);
+          } else {
+            setCurrentRound(99);
+            setCurrentExchange(1);
+          }
         }
       }
     );
@@ -252,13 +368,18 @@ export default function DebateView({
       "debate-agent-response",
       (event) => {
         if (event.payload.decision_id !== decisionId) return;
+        setDebateRunning(true);
         const { round_number, exchange_number, agent, content } = event.payload;
         const streamKey = `${round_number}-${exchange_number}-${agent}`;
 
-        if (round_number !== 99) {
-          setCurrentRound(round_number);
-        } else {
-          setCurrentRound(99);
+        if (!SYNC_TRANSCRIPT_WITH_LIVE_AUDIO || !hasLiveAudio) {
+          if (round_number !== 99) {
+            setCurrentRound(round_number);
+            setCurrentExchange(exchange_number || 1);
+          } else {
+            setCurrentRound(99);
+            setCurrentExchange(1);
+          }
         }
 
         if (SYNC_TRANSCRIPT_WITH_LIVE_AUDIO) {
@@ -288,9 +409,8 @@ export default function DebateView({
             return next;
           });
 
-          setRounds((prev) => [
-            ...prev,
-            {
+          setRounds((prev) =>
+            appendUniqueRound(prev, {
               id: `${round_number}-${exchange_number}-${agent}-${Date.now()}`,
               decision_id: decisionId,
               round_number,
@@ -298,8 +418,8 @@ export default function DebateView({
               agent,
               content,
               created_at: new Date().toISOString(),
-            },
-          ]);
+            })
+          );
         }
       }
     );
@@ -361,7 +481,9 @@ export default function DebateView({
         } catch {
           // Use default path
         }
-        setShowPlayer(true);
+        // Do not auto-open full replay while live queue may still be playing.
+        // User can open it from the "Listen to Debate" button once ready.
+        setShowPlayer(false);
       }
     );
 
@@ -383,13 +505,20 @@ export default function DebateView({
       unlistenAudioComplete.then((fn) => fn());
       unlistenAudioError.then((fn) => fn());
     };
-  }, [decisionId, onDebateComplete]);
+  }, [decisionId, onDebateComplete, hasLiveAudio]);
 
   useEffect(() => {
     if (liveAudio.segmentsReady > 0) {
       sawLiveAudioRef.current = true;
+      setHasLiveAudio(true);
     }
   }, [liveAudio.segmentsReady]);
+
+  const liveQueueBuffered =
+    debateRunning &&
+    liveAudio.maxReadySegmentIndex >= 0 &&
+    liveAudio.nextSegmentIndex <= liveAudio.maxReadySegmentIndex;
+  const liveQueueActive = liveAudio.isPlaying || liveQueueBuffered;
 
   // Reveal transcript only when the corresponding audio segment starts playing.
   useEffect(() => {
@@ -401,8 +530,10 @@ export default function DebateView({
 
     if (segment.roundNumber !== 99) {
       setCurrentRound(segment.roundNumber);
+      setCurrentExchange(segment.exchangeNumber || 1);
     } else {
       setCurrentRound(99);
+      setCurrentExchange(1);
     }
 
     const key = `${segment.roundNumber}-${segment.exchangeNumber}-${segment.agent}`;
@@ -464,9 +595,8 @@ export default function DebateView({
           delete next[key];
           return next;
         });
-        setRounds((prev) => [
-          ...prev,
-          {
+        setRounds((prev) =>
+          appendUniqueRound(prev, {
             id: `${segment.roundNumber}-${segment.exchangeNumber}-${segment.agent}-${Date.now()}`,
             decision_id: decisionId,
             round_number: segment.roundNumber,
@@ -474,8 +604,8 @@ export default function DebateView({
             agent: segment.agent,
             content: fullText,
             created_at: new Date().toISOString(),
-          },
-        ]);
+          })
+        );
       }
     }, tickMs);
   }, [decisionId, liveAudio.currentSegmentIndex, liveAudio.currentSegment]);
@@ -485,6 +615,7 @@ export default function DebateView({
   useEffect(() => {
     if (!SYNC_TRANSCRIPT_WITH_LIVE_AUDIO) return;
     if (debateRunning) return;
+    if (hasLiveAudio && liveQueueActive) return;
     if (Object.keys(pendingResponses).length === 0) return;
 
     const delayMs = sawLiveAudioRef.current ? 1500 : 0;
@@ -502,18 +633,21 @@ export default function DebateView({
         return a.received_at - b.received_at;
       });
 
-      setRounds((prev) => [
-        ...prev,
-        ...remaining.map((item) => ({
-          id: `${item.round_number}-${item.exchange_number}-${item.agent}-${item.received_at}`,
-          decision_id: decisionId,
-          round_number: item.round_number,
-          exchange_number: item.exchange_number,
-          agent: item.agent,
-          content: item.content,
-          created_at: new Date(item.received_at).toISOString(),
-        })),
-      ]);
+      setRounds((prev) =>
+        remaining.reduce(
+          (acc, item) =>
+            appendUniqueRound(acc, {
+              id: `${item.round_number}-${item.exchange_number}-${item.agent}-${item.received_at}`,
+              decision_id: decisionId,
+              round_number: item.round_number,
+              exchange_number: item.exchange_number,
+              agent: item.agent,
+              content: item.content,
+              created_at: new Date(item.received_at).toISOString(),
+            }),
+          prev
+        )
+      );
 
       setStreamingMessages((prev) => {
         const next = { ...prev };
@@ -528,7 +662,7 @@ export default function DebateView({
     }, delayMs);
 
     return () => clearTimeout(flushTimer);
-  }, [debateRunning, decisionId, pendingResponses]);
+  }, [debateRunning, decisionId, pendingResponses, hasLiveAudio, liveQueueActive]);
 
   useEffect(() => {
     return () => {
@@ -553,9 +687,10 @@ export default function DebateView({
 
       // Determine current round from loaded data
       if (data.length > 0) {
-        const maxRound = Math.max(...data.map((r) => r.round_number));
-        setCurrentRound(maxRound);
-        if (maxRound === 99) {
+        const last = data[data.length - 1];
+        setCurrentRound(last.round_number);
+        setCurrentExchange(last.exchange_number || 1);
+        if (last.round_number === 99) {
           setDebateRunning(false);
         }
       }
@@ -570,6 +705,53 @@ export default function DebateView({
       setDebateRunning(false);
     } catch (err) {
       console.error("Failed to cancel debate:", err);
+    }
+  }
+
+  async function handleExportPdf() {
+    try {
+      setPdfExporting(true);
+      const [decision, agentFiles] = await Promise.all([
+        invoke<{
+          title: string;
+          debate_brief: string | null;
+          summary_json: string | null;
+          debate_started_at: string | null;
+          debate_completed_at: string | null;
+        }>("get_decision", { decisionId }),
+        invoke<{ filename: string; content: string }[]>("get_agent_files"),
+      ]);
+
+      const pdfBytes = generateDebatePdf({
+        decision: {
+          title: debateTitle || decision.title,
+          debate_brief: decision.debate_brief,
+          summary_json: decision.summary_json,
+          debate_started_at: decision.debate_started_at,
+          debate_completed_at: decision.debate_completed_at,
+        },
+        rounds,
+        registry,
+        agentPrompts: agentFiles.filter((f) => {
+          const key = f.filename.replace(/\.md$/, "");
+          return rounds.some((r) => r.agent === key);
+        }),
+      });
+
+      const base64 = btoa(
+        pdfBytes.reduce((data, byte) => data + String.fromCharCode(byte), "")
+      );
+
+      const outputPath = await invoke<string>("save_pdf", {
+        decisionId,
+        pdfBase64: base64,
+      });
+
+      await revealItemInDir(outputPath);
+    } catch (err) {
+      console.error("Failed to export PDF:", err);
+    } finally {
+      setPdfExporting(false);
     }
   }
 
@@ -624,14 +806,25 @@ export default function DebateView({
   // Sort merged groups
   mergedGroups.sort((a, b) => a.roundNumber - b.roundNumber || a.exchangeNumber - b.exchangeNumber);
 
+  const hasInFlightContent =
+    Object.keys(streamingMessages).length > 0 ||
+    Object.keys(pendingResponses).length > 0;
+  const progressIsRunning = debateRunning || hasInFlightContent || liveQueueActive;
+  const showLiveAudioIndicator =
+    liveAudio.segmentsReady > 0 && (progressIsRunning || liveAudio.currentAgent != null);
+
   return (
     <div className="flex-1 flex flex-col min-w-0 min-h-0">
       {/* Progress bar */}
       <DebateProgressBar
         currentRound={currentRound}
+        currentExchange={currentExchange}
         totalRounds={totalRounds}
-        isRunning={debateRunning}
+        isRunning={progressIsRunning}
         quickMode={quickMode}
+        modeLabel={modeLabel}
+        moderatorDirected={moderatorDirected}
+        fixedExchangeCount={fixedExchangeCount}
       />
 
       {/* Debate content */}
@@ -647,7 +840,7 @@ export default function DebateView({
             const key = `${group.roundNumber}-${group.exchangeNumber}`;
             const isCollapsed = collapsedRounds.has(key);
             const isActive =
-              debateRunning && group.roundNumber === currentRound;
+              progressIsRunning && group.roundNumber === currentRound;
             const isModerator = group.roundNumber === 99;
 
             return (
@@ -678,22 +871,24 @@ export default function DebateView({
                       )
                     )}
                     {/* Streaming entries (in-progress) */}
-                    {group.streamingEntries?.map(([streamKey, msg]) =>
-                      msg.agent === "moderator" ? (
-                        <ModeratorVerdict
-                          key={`stream-${streamKey}`}
-                          content={msg.content}
-                        />
-                      ) : (
-                        <DebateAgentMessage
-                          key={`stream-${streamKey}`}
-                          agent={msg.agent}
-                          content={msg.content}
-                          isStreaming
-                          registry={registry}
-                        />
-                      )
-                    )}
+                    {group.streamingEntries
+                      ?.filter(([, msg]) => !group.entries.some((entry) => entry.agent === msg.agent))
+                      .map(([streamKey, msg]) =>
+                        msg.agent === "moderator" ? (
+                          <ModeratorVerdict
+                            key={`stream-${streamKey}`}
+                            content={msg.content}
+                          />
+                        ) : (
+                          <DebateAgentMessage
+                            key={`stream-${streamKey}`}
+                            agent={msg.agent}
+                            content={msg.content}
+                            isStreaming
+                            registry={registry}
+                          />
+                        )
+                      )}
                   </div>
                 )}
               </div>
@@ -711,7 +906,7 @@ export default function DebateView({
       </ScrollArea>
 
       {/* Live audio indicator — plays TTS as debate streams */}
-      {debateRunning && liveAudio.segmentsReady > 0 && (
+      {showLiveAudioIndicator && (
         <div className="border-t border-border px-4 py-2 flex items-center gap-3">
           {liveAudio.currentAgent ? (
             <>
@@ -791,18 +986,40 @@ export default function DebateView({
       <div className="border-t border-border px-4 py-2 flex items-center gap-2">
         <Button variant="ghost" size="sm" onClick={onBackToChat}>
           <ArrowLeft className="h-3.5 w-3.5 mr-1.5" />
-          Back to Chat
+          {backButtonLabel || "Back to Chat"}
         </Button>
-        {!debateRunning && audioManifest && !showPlayer && (
+        {!debateRunning && rounds.length > 0 && (
           <Button
             variant="outline"
             size="sm"
-            onClick={() => setShowPlayer(true)}
-            className="ml-auto"
+            onClick={handleExportPdf}
+            disabled={pdfExporting}
+            className={!audioManifest || showPlayer ? "ml-auto" : ""}
           >
-            <Volume2 className="h-3.5 w-3.5 mr-1.5" />
-            Listen to Debate
+            <FileText className="h-3.5 w-3.5 mr-1.5" />
+            {pdfExporting ? "Exporting..." : "Export PDF"}
           </Button>
+        )}
+        {!debateRunning && audioManifest && !showPlayer && (
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowVideoExport(true)}
+              className="ml-auto"
+            >
+              <Video className="h-3.5 w-3.5 mr-1.5" />
+              Export Video
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowPlayer(true)}
+            >
+              <Volume2 className="h-3.5 w-3.5 mr-1.5" />
+              Listen to Debate
+            </Button>
+          </>
         )}
         {!debateRunning && !audioManifest && !audioGenerating && rounds.length > 0 && (
           <Button
@@ -817,7 +1034,6 @@ export default function DebateView({
                 setAudioGenerating(false);
               }
             }}
-            className="ml-auto"
           >
             <Mic className="h-3.5 w-3.5 mr-1.5" />
             Generate Audio
@@ -835,6 +1051,18 @@ export default function DebateView({
           </Button>
         )}
       </div>
+
+      {/* Video export dialog */}
+      {showVideoExport && audioManifest && audioDir && (
+        <VideoExportDialog
+          decisionId={decisionId}
+          title={debateTitle || "Debate"}
+          manifest={audioManifest}
+          audioDir={audioDir}
+          registry={registry}
+          onClose={() => setShowVideoExport(false)}
+        />
+      )}
     </div>
   );
 }

@@ -7,6 +7,7 @@ mod decisions;
 mod llm;
 mod profile;
 mod tts;
+mod video;
 
 use commands::AppState;
 use std::sync::Mutex;
@@ -38,6 +39,7 @@ pub fn run() {
             commands::get_conversations,
             commands::get_messages,
             commands::get_settings,
+            commands::get_openrouter_models,
             commands::save_settings,
             commands::get_profile_files,
             commands::open_profile_folder,
@@ -62,6 +64,11 @@ pub fn run() {
             commands::cancel_debate,
             commands::generate_debate_audio,
             commands::get_debate_audio,
+            commands::create_standalone_debate,
+            commands::start_standalone_debate,
+            commands::get_standalone_debates,
+            commands::render_video,
+            commands::save_pdf,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

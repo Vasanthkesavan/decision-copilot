@@ -15,6 +15,7 @@ coverage
 playwright-report
 test-results
 blob-report
+*.mp4
 
 # Editor directories and files
 .vscode/*

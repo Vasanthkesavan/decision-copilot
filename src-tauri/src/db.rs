@@ -300,7 +300,33 @@ impl Database {
     pub fn get_decisions(&self) -> Result<Vec<Decision>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, title, status, summary_json, user_choice, user_choice_reasoning, outcome, outcome_date, debate_brief, debate_started_at, debate_completed_at, created_at, updated_at FROM decisions ORDER BY updated_at DESC"
+            "SELECT d.id, d.conversation_id, d.title, d.status, d.summary_json, d.user_choice, d.user_choice_reasoning, d.outcome, d.outcome_date, d.debate_brief, d.debate_started_at, d.debate_completed_at, d.created_at, d.updated_at FROM decisions d JOIN conversations c ON d.conversation_id = c.id WHERE c.type != 'debate' ORDER BY d.updated_at DESC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Decision {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                title: row.get(2)?,
+                status: row.get(3)?,
+                summary_json: row.get(4)?,
+                user_choice: row.get(5)?,
+                user_choice_reasoning: row.get(6)?,
+                outcome: row.get(7)?,
+                outcome_date: row.get(8)?,
+                debate_brief: row.get(9)?,
+                debate_started_at: row.get(10)?,
+                debate_completed_at: row.get(11)?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_standalone_debates(&self) -> Result<Vec<Decision>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT d.id, d.conversation_id, d.title, d.status, d.summary_json, d.user_choice, d.user_choice_reasoning, d.outcome, d.outcome_date, d.debate_brief, d.debate_started_at, d.debate_completed_at, d.created_at, d.updated_at FROM decisions d JOIN conversations c ON d.conversation_id = c.id WHERE c.type = 'debate' ORDER BY d.updated_at DESC"
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Decision {

@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub elevenlabs_api_key: String,
     #[serde(default = "default_tts_provider")]
     pub tts_provider: String, // "elevenlabs" or "openai"
+    #[serde(default = "default_elevenlabs_model")]
+    pub elevenlabs_model: String,
     #[serde(default)]
     pub voices: HashMap<String, String>, // agent_key -> voice_id overrides
 }
@@ -27,6 +29,10 @@ fn default_tts_provider() -> String {
     "elevenlabs".to_string()
 }
 
+fn default_elevenlabs_model() -> String {
+    "eleven_flash_v2_5".to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -35,6 +41,7 @@ impl Default for AppConfig {
             agent_models: HashMap::new(),
             elevenlabs_api_key: String::new(),
             tts_provider: default_tts_provider(),
+            elevenlabs_model: default_elevenlabs_model(),
             voices: HashMap::new(),
         }
     }
@@ -77,6 +84,7 @@ mod tests {
         assert!(loaded.agent_models.is_empty());
         assert!(loaded.elevenlabs_api_key.is_empty());
         assert_eq!(loaded.tts_provider, "elevenlabs");
+        assert_eq!(loaded.elevenlabs_model, "eleven_flash_v2_5");
         assert!(loaded.voices.is_empty());
     }
 
@@ -94,6 +102,7 @@ mod tests {
             agent_models,
             elevenlabs_api_key: "sk-eleven-test".to_string(),
             tts_provider: "openai".to_string(),
+            elevenlabs_model: "eleven_turbo_v2_5".to_string(),
             voices: HashMap::new(),
         };
 
@@ -108,6 +117,7 @@ mod tests {
         );
         assert_eq!(loaded.elevenlabs_api_key, "sk-eleven-test");
         assert_eq!(loaded.tts_provider, "openai");
+        assert_eq!(loaded.elevenlabs_model, "eleven_turbo_v2_5");
     }
 
     #[test]
@@ -124,5 +134,6 @@ mod tests {
         assert_eq!(loaded.openrouter_api_key, "sk-old");
         assert!(loaded.elevenlabs_api_key.is_empty());
         assert_eq!(loaded.tts_provider, "elevenlabs");
+        assert_eq!(loaded.elevenlabs_model, "eleven_flash_v2_5");
     }
 }

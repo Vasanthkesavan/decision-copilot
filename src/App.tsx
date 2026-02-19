@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Menu } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
   DialogContent,
@@ -16,6 +17,10 @@ import ChatView from "./components/ChatView";
 import DecisionView from "./components/DecisionView";
 import ProfileView from "./components/ProfileView";
 import CommitteeView from "./components/CommitteeView";
+import StandaloneDebateView from "./components/StandaloneDebateView";
+import DebateModelSelectionDialog, {
+  type StandaloneDebateConfig,
+} from "./components/DebateModelSelectionDialog";
 import Settings from "./components/Settings";
 import "./App.css";
 
@@ -33,7 +38,7 @@ interface CreateDecisionResponse {
 type Theme = "light" | "dark";
 const THEME_STORAGE_KEY = "open-council-theme";
 
-type ViewMode = "chat" | "decision" | "profile" | "committee";
+type ViewMode = "chat" | "decision" | "profile" | "committee" | "standalone-debate";
 
 function getInitialTheme(): Theme {
   if (typeof window === "undefined") {
@@ -63,6 +68,16 @@ function App() {
   const [activeModel, setActiveModel] = useState("");
   const [theme, setTheme] = useState<Theme>(() => getInitialTheme());
 
+  // Standalone debate state
+  const [currentDebateDecisionId, setCurrentDebateDecisionId] = useState<string | null>(null);
+  const [debateQuickMode, setDebateQuickMode] = useState(false);
+  const [currentDebateConfig, setCurrentDebateConfig] = useState<StandaloneDebateConfig | null>(null);
+  const [showNewDebateInput, setShowNewDebateInput] = useState(false);
+  const [newDebateTitle, setNewDebateTitle] = useState("");
+  const [newDebatePrompt, setNewDebatePrompt] = useState("");
+  const [pendingDebate, setPendingDebate] = useState<{ title: string; prompt: string } | null>(null);
+  const [showDebateModelSelection, setShowDebateModelSelection] = useState(false);
+
   useEffect(() => {
     checkApiKey();
   }, []);
@@ -91,18 +106,24 @@ function App() {
   function handleNewChat() {
     setCurrentConversationId(null);
     setCurrentDecisionId(null);
+    setCurrentDebateDecisionId(null);
+    setCurrentDebateConfig(null);
     setViewMode("chat");
   }
 
   function handleSelectConversation(id: string) {
     setCurrentConversationId(id);
     setCurrentDecisionId(null);
+    setCurrentDebateDecisionId(null);
+    setCurrentDebateConfig(null);
     setViewMode("chat");
   }
 
   function handleSelectDecision(conversationId: string, decisionId: string) {
     setCurrentConversationId(conversationId);
     setCurrentDecisionId(decisionId);
+    setCurrentDebateDecisionId(null);
+    setCurrentDebateConfig(null);
     setViewMode("decision");
   }
 
@@ -134,6 +155,70 @@ function App() {
     } catch (err) {
       console.error("Failed to create decision:", err);
     }
+  }
+
+  // ── Standalone Debate Handlers ──
+
+  function handleNewDebate() {
+    setShowNewDebateInput(true);
+    setNewDebateTitle("");
+    setNewDebatePrompt("");
+  }
+
+  async function handleCreateDebateStep1() {
+    const title = newDebateTitle.trim();
+    const prompt = newDebatePrompt.trim();
+    if (!title || !prompt) return;
+
+    setShowNewDebateInput(false);
+    setPendingDebate({ title, prompt });
+    setShowDebateModelSelection(true);
+  }
+
+  async function handleStartStandaloneDebate(
+    selectedModels: string[],
+    debateConfig: StandaloneDebateConfig
+  ) {
+    setShowDebateModelSelection(false);
+    if (!pendingDebate) return;
+    const debateRequest = pendingDebate;
+
+    try {
+      const result = await invoke<CreateDecisionResponse>("create_standalone_debate", {
+        title: debateRequest.title,
+        prompt: debateRequest.prompt,
+      });
+
+      setCurrentConversationId(result.conversation_id);
+      setCurrentDecisionId(null);
+      setCurrentDebateDecisionId(result.decision_id);
+      setCurrentDebateConfig(debateConfig);
+      const quickMode =
+        debateConfig.mode === "fixed" && (debateConfig.exchangeCount || 0) === 0;
+      setDebateQuickMode(quickMode);
+      setViewMode("standalone-debate");
+      setRefreshKey((k) => k + 1);
+
+      await invoke("start_standalone_debate", {
+        decisionId: result.decision_id,
+        quickMode,
+        selectedModels,
+        prompt: debateRequest.prompt,
+        debateConfig,
+      });
+      setPendingDebate(null);
+    } catch (err) {
+      console.error("Failed to start standalone debate:", err);
+    }
+  }
+
+  function handleSelectStandaloneDebate(conversationId: string, decisionId: string) {
+    setCurrentConversationId(conversationId);
+    setCurrentDecisionId(null);
+    setCurrentDebateDecisionId(decisionId);
+    setCurrentDebateConfig(null);
+    setDebateQuickMode(false);
+    setViewMode("standalone-debate");
   }
 
   function handleSettingsSaved() {
@@ -172,6 +257,8 @@ function App() {
           onSelectDecision={handleSelectDecision}
           onNewChat={handleNewChat}
           onNewDecision={handleNewDecision}
+          onNewDebate={handleNewDebate}
+          onSelectStandaloneDebate={handleSelectStandaloneDebate}
           onOpenSettings={() => setShowSettings(true)}
           onOpenProfile={handleOpenProfile}
           onOpenCommittee={handleOpenCommittee}
@@ -196,6 +283,13 @@ function App() {
           <ProfileView onNavigateToChat={handleNewChat} />
         ) : viewMode === "committee" ? (
           <CommitteeView onNavigateToChat={handleNewChat} />
+        ) : viewMode === "standalone-debate" && currentDebateDecisionId ? (
+          <StandaloneDebateView
+            decisionId={currentDebateDecisionId}
+            quickMode={debateQuickMode}
+            debateConfig={currentDebateConfig || undefined}
+            onBack={handleNewChat}
+          />
         ) : viewMode === "decision" && currentConversationId && currentDecisionId ? (
           <DecisionView
             conversationId={currentConversationId}
@@ -257,6 +351,61 @@ function App() {
             </DialogFooter>
           </DialogContent>
         </Dialog>
+      )}
+
+      {/* New Debate Modal - Step 1: Topic & Prompt */}
+      {showNewDebateInput && (
+        <Dialog open onOpenChange={(open) => !open && setShowNewDebateInput(false)}>
+          <DialogContent className="sm:max-w-lg">
+            <DialogHeader>
+              <DialogTitle>New Debate</DialogTitle>
+              <DialogDescription>
+                Set the topic and context for your debate.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3">
+              <Input
+                value={newDebateTitle}
+                onChange={(e) => setNewDebateTitle(e.target.value)}
+                placeholder="Debate title, e.g., Is AI consciousness possible?"
+                autoFocus
+              />
+              <Textarea
+                value={newDebatePrompt}
+                onChange={(e) => setNewDebatePrompt(e.target.value)}
+                placeholder="Describe what should be debated. Provide context, specific questions, or positions you want explored..."
+                rows={4}
+                className="resize-none"
+              />
+            </div>
+            <DialogFooter>
+              <Button
+                variant="ghost"
+                onClick={() => setShowNewDebateInput(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={handleCreateDebateStep1}
+                disabled={!newDebateTitle.trim() || !newDebatePrompt.trim()}
+              >
+                Choose Models
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* New Debate Modal - Step 2: Model Selection */}
+      {showDebateModelSelection && (
+        <DebateModelSelectionDialog
+          defaultModel={activeModel}
+          onStart={handleStartStandaloneDebate}
+          onClose={() => {
+            setShowDebateModelSelection(false);
+            setPendingDebate(null);
+          }}
+        />
       )}
     </div>
   );
